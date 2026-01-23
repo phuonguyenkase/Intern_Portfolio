@@ -10,7 +10,6 @@ tech_scores = {}
 foreign_scores = {}
 risk_scores = {}
 
-# Fixed list of bank symbols (no need to import from Fund_Bank)
 r = requests.get("http://192.168.8.190:8000/MKD/stock_info")
 r.raise_for_status()
 all_stocks = r.json()
@@ -49,7 +48,6 @@ class APIFetcher:
         except Exception as e:
             print(f"Error fetching batch: {type(e).__name__}: {e}")
         
-        # Convert to DataFrames
         result = {}
         for symbol, data in all_data.items():
             try:
@@ -251,7 +249,6 @@ class ForeignInvestorScorer:
         ]
 
     def evaluate_criterion(self, fi_dict, criterion):
-        """Evaluate a single criterion based on foreign investor data"""
         try:
             code = criterion['code']
             pct_value = fi_dict.get(code)
@@ -275,14 +272,13 @@ class ForeignInvestorScorer:
             return {'pass': False, 'reason': str(e)}
 
     def score_bank(self, symbol, fi_dict):
-        """Calculate foreign investor score (0-5 points)"""
         if not fi_dict or not isinstance(fi_dict, dict):
             return {'symbol': symbol, 'score': 0, 'reason': 'Invalid data'}
     
         results = {}
         points = 0
     
-        # Must-have criteria (2 points if all pass)
+        # Must-have criteria
         must_have_results = []
         for crit in self.criteria:
             if crit['must_have']:
@@ -293,7 +289,7 @@ class ForeignInvestorScorer:
         if must_have_results and all(must_have_results):
             points += 2
     
-        # Optional criteria (3 points distributed)
+        # Optional criteria
         optional_criteria = [c for c in self.criteria if not c['must_have']]
         if optional_criteria:
             for crit in optional_criteria:
@@ -314,8 +310,8 @@ class ForeignInvestorScorer:
 def calculate_foreign_investor_metrics(symbol_list, start_date, end_date):
     all_symbol_data = {}
     max_retries = 3
-    skipped = []  # Symbols with no/invalid data
-    errors = []   # Symbols failed after retries
+    skipped = []
+    errors = []
     
     for idx, symbol in enumerate(symbol_list):
         success = False
@@ -440,7 +436,6 @@ def calculate_foreign_investor_metrics(symbol_list, start_date, end_date):
     return all_symbol_data
 
 def run_analysis():
-    """Main analysis function - fetches data and calculates all scores"""
     global tech_scores, foreign_scores, risk_scores, banks
     
     print(f"Analyzing {len(banks)} banks: {', '.join(banks)}")
@@ -532,9 +527,8 @@ def run_analysis():
                     api_count += 1
                     continue
         except Exception as e:
-            pass  # Silent, will try fallback
+            pass
         
-        # Fallback: compute from daily stock data
         try:
             src = stock_data.get(symbol)
             if src is not None and len(src) > 0:
@@ -557,7 +551,6 @@ def run_analysis():
     scorer = TechnicalAnalysisScorer()
     tech_scores.clear()
     
-    # Ensure vni_series is available (fallback to None if undefined)
     try:
         _ = vni_series
     except NameError:
@@ -594,13 +587,12 @@ def run_analysis():
             print(f"Foreign Investor scores calculated for {len(foreign_scores)} banks\n")
 
     except requests.Timeout:
-        print("  Timeout: Foreign investor request timed out\n")
+        print("Timeout: Foreign investor request timed out\n")
     except Exception as e:
         print(f"Foreign Investor error: {type(e).__name__}: {e}\n")
 
     # %% CALCULATE RISK METRICS FROM STOCK DATA
     def calculate_risk_metrics(df, symbol=None):
-        """Calculate drawdown, volatility, VaR/CVaR, ADV from stock daily data"""
         if df is None or len(df) < 20:
             return {}
     
@@ -656,7 +648,6 @@ def run_analysis():
 
 
     def calculate_drawdown_3m(df):
-        """Backward compatible wrapper for drawdown calculation"""
         metrics = calculate_risk_metrics(df)
         return metrics.get('dd_3m')
 
@@ -785,7 +776,6 @@ def run_analysis():
             return results
 
         def score_bank(self, symbol, rec, all_records=None):
-            """Calculate risk score for a bank"""
             res = self.evaluate(rec, all_records)
 
             # If hard reject, score = 0
@@ -808,7 +798,6 @@ def run_analysis():
             }
 
     #%%
-    # Initialize risk_scores before try block (always importable, even if API fails)
     risk_scores.clear()
 
     try:
