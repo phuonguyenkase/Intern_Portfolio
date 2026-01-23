@@ -1,0 +1,14 @@
+# Untracked files
+Bank_FS
+Bank_Stockdata.py
+Fund_INS.py
+Fund_Materials.py
+Intern_Portfolio/
+REFACTORING_SUMMARY.md
+TechAna_Draft.py
+__pycache__/
+debug_import.py
+fix_indent.py
+tempCodeRunnerFile.py
+*.pyc
+.DS_Store
