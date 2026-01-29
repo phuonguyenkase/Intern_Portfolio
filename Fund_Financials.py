@@ -63,73 +63,122 @@ except Exception as e:
 print(financials_symbols)
 
 # %%
-CODE_MAPPING = {
-    'ryq3': 'Current_Ratio',
-    'ryq2': 'Quick_Ratio',
-    'ryq1': 'Cash_Ratio',
-    'ryq16': 'DSO',
-    'ryq71': 'Leverage',
-    'ryq20': 'Working_Capital_Efficiency'
-}
-
 class LiquidityScorer:
     def __init__(self):
         self.criteria = [
-            {'id': 1, 'name': 'Current ratio safety', 'code': 'ryq3', 'type': 'absolute', 'direction': 'higher_better', 'threshold': 1.0, 'must_have': True},
-            {'id': 2, 'name': 'Quick ratio safety', 'code': 'ryq2', 'type': 'absolute', 'direction': 'higher_better', 'threshold': 0.8, 'must_have': True},
-            {'id': 3, 'name': 'Cash ratio buffer', 'code': 'ryq1', 'type': 'peer_percentile', 'direction': 'higher_better', 'threshold': 0.50, 'must_have': False},
-            {'id': 4, 'name': 'DSO control', 'code': 'ryq16', 'type': 'peer_percentile', 'direction': 'lower_better', 'threshold': 0.60, 'must_have': False},
-            {'id': 5, 'name': 'Leverage discipline', 'code': 'ryq71', 'type': 'peer_percentile', 'direction': 'lower_better', 'threshold': 0.50, 'must_have': False},
-            {'id': 6, 'name': 'Working-cap efficiency', 'code': 'ryq20', 'type': 'peer_percentile', 'direction': 'lower_better', 'threshold': 0.60, 'must_have': False},
+            {'id': 1, 'name': 'Current ratio safety', 'code': 'ryq3', 'type': 'absolute', 'direction': 'higher', 'threshold': 1.0, 'must_have': True},
+            {'id': 2, 'name': 'Quick ratio safety', 'code': 'ryq2', 'type': 'absolute', 'direction': 'higher', 'threshold': 0.8, 'must_have': True},
+            {'id': 3, 'name': 'Cash ratio buffer', 'code': 'ryq1', 'type': 'peer_percentile', 'direction': 'higher', 'cut': 0.50, 'must_have': False},
+            {'id': 4, 'name': 'DSO control', 'code': 'ryq16', 'type': 'peer_percentile', 'direction': 'lower', 'cut': 0.60, 'must_have': False},
+            {'id': 5, 'name': 'Leverage discipline', 'code': 'ryq71', 'type': 'peer_percentile', 'direction': 'lower', 'cut': 0.50, 'must_have': False},
+            {'id': 6, 'name': 'Working-cap efficiency', 'code': 'ryq20', 'type': 'peer_percentile', 'direction': 'lower', 'cut': 0.60, 'must_have': False},
         ]
     
-    def get_metric_series(self, financial_df, code):
-        """Extract series of values for a metric code (last 12 quarters)"""
-        metric_data = financial_df[financial_df['code'] == code]
-        if len(metric_data) > 0:
-            values = pd.to_numeric(metric_data['value'], errors='coerce').dropna()
-            if len(values) > 0:
-                return values.tail(12)
-        return pd.Series(dtype=float)
-    
-    def get_metric_value(self, financial_df, code):
-        """Extract the latest value for a metric code"""
-        series = self.get_metric_series(financial_df, code)
-        return series.iloc[-1] if len(series) > 0 else None
+    def get_metric_series(self, financial_df, code, periods=12):
+        """Extract last N period values for a metric code"""
+        metric_data = financial_df[financial_df['code'] == code].copy()
+        if metric_data.empty:
+            return []
+
+        if 'date' in metric_data.columns:
+            metric_data = metric_data.sort_values('date')
+            metric_data['period_key'] = metric_data['date']
+        elif {'year', 'quarter'}.issubset(metric_data.columns):
+            metric_data = metric_data.sort_values(['year', 'quarter'])
+            metric_data['period_key'] = list(zip(metric_data['year'], metric_data['quarter']))
+        else:
+            metric_data = metric_data.reset_index().rename(columns={'index': 'period_key'})
+
+        metric_data = metric_data.dropna(subset=['value'])
+        if periods is not None:
+            metric_data = metric_data.tail(periods)
+
+        return list(metric_data[['period_key', 'value']].itertuples(index=False, name=None))
+
+    def get_metric_period_dict(self, financial_df, code):
+        """Map period_key -> value for a metric code"""
+        metric_data = financial_df[financial_df['code'] == code].copy()
+        if metric_data.empty:
+            return {}
+
+        if 'date' in metric_data.columns:
+            metric_data = metric_data.sort_values('date')
+            metric_data['period_key'] = metric_data['date']
+        elif {'year', 'quarter'}.issubset(metric_data.columns):
+            metric_data = metric_data.sort_values(['year', 'quarter'])
+            metric_data['period_key'] = list(zip(metric_data['year'], metric_data['quarter']))
+        else:
+            metric_data = metric_data.reset_index().rename(columns={'index': 'period_key'})
+
+        metric_data = metric_data.dropna(subset=['value'])
+        return dict(metric_data[['period_key', 'value']].itertuples(index=False, name=None))
     
     def evaluate_criterion(self, financial_df, criterion, all_financials_data):
-        """Evaluate a single criterion for a financial"""
+        """Evaluate a single criterion over the last 12 quarters (with pass rate ≥ 50%)"""
         try:
-            code = criterion['code']
             crit_type = criterion['type']
-            direction = criterion['direction']
-            
-            latest_value = self.get_metric_value(financial_df, code)
-            
-            if latest_value is None:
-                return {'pass': False, 'reason': f'Code {code} not found', 'value': None}
-            
-            # Absolute criterion
+
             if crit_type == 'absolute':
-                if direction == 'higher_better':
-                    pass_check = latest_value >= criterion['threshold']
+                series = self.get_metric_series(financial_df, criterion['code'], periods=12)
+                if not series:
+                    return {'pass': False, 'reason': f"Code {criterion['code']} not found", 'values': []}
+
+                values = [v for _, v in series]
+                if criterion['direction'] == 'lower':
+                    period_passes = [v <= criterion['threshold'] for v in values]
                 else:
-                    pass_check = latest_value <= criterion['threshold']
-                return {'pass': pass_check, 'value': latest_value, 'threshold': criterion['threshold']}
-            
-            # Peer percentile criterion
-            elif crit_type == 'peer_percentile':
-                peer_values = [self.get_metric_value(df, code) for df in all_financials_data.values()]
-                peer_values = [v for v in peer_values if v is not None]
-                if len(peer_values) > 0:
-                    if direction == 'lower_better':
-                        pct = sum(1 for v in peer_values if v >= latest_value) / len(peer_values)
-                        pass_check = pct <= criterion['threshold']
+                    period_passes = [v >= criterion['threshold'] for v in values]
+                
+                pass_rate = sum(period_passes) / len(period_passes) if period_passes else 0
+                is_passed = pass_rate >= 0.5
+                
+                return {
+                    'pass': is_passed,
+                    'pass_rate': pass_rate,
+                    'values': values,
+                    'threshold': criterion['threshold'],
+                    'periods_used': len(values)
+                }
+
+            if crit_type == 'peer_percentile':
+                series = self.get_metric_series(financial_df, criterion['code'], periods=12)
+                if not series:
+                    return {'pass': False, 'reason': 'No period values available', 'values': []}
+
+                period_values = {p: v for p, v in series}
+                peer_maps = [self.get_metric_period_dict(df, criterion['code']) for df in all_financials_data.values()]
+
+                period_passes = []
+                percentiles = []
+                for period_key, value in period_values.items():
+                    peer_values = [pm.get(period_key) for pm in peer_maps if pm.get(period_key) is not None]
+                    if not peer_values:
+                        period_passes.append(False)
+                        percentiles.append(None)
+                        continue
+
+                    if criterion['direction'] == 'lower':
+                        pct = (value <= pd.Series(peer_values)).sum() / len(peer_values)
+                        pass_check = pct <= criterion['cut']
                     else:
-                        pct = sum(1 for v in peer_values if v <= latest_value) / len(peer_values)
-                        pass_check = pct >= criterion['threshold']
-                    return {'pass': pass_check, 'value': latest_value, 'percentile': pct, 'threshold': criterion['threshold']}
-            
+                        pct = (value >= pd.Series(peer_values)).sum() / len(peer_values)
+                        pass_check = pct >= criterion['cut']
+
+                    period_passes.append(pass_check)
+                    percentiles.append(pct)
+                
+                pass_rate = sum(period_passes) / len(period_passes) if period_passes else 0
+                is_passed = pass_rate >= 0.5
+                
+                return {
+                    'pass': is_passed,
+                    'pass_rate': pass_rate,
+                    'values': list(period_values.values()),
+                    'percentiles': percentiles,
+                    'cut': criterion['cut'],
+                    'periods_used': len(period_values)
+                }
+
             return {'pass': False, 'reason': 'Unknown criterion type'}
         
         except Exception as e:
@@ -176,61 +225,119 @@ for idx, (symbol, financials_df) in enumerate(financials_ratios_data.items()):
 class ProfitabilityScorer:
     def __init__(self):
         self.criteria = [
-            {'id': 1, 'name': 'ROE minimum', 'code': 'ryq12', 'type': 'absolute', 'direction': 'higher_better', 'threshold': 0.10, 'must_have': True},
-            {'id': 2, 'name': 'Net margin minimum', 'code': 'ryq29', 'type': 'absolute', 'direction': 'higher_better', 'threshold': 0.10, 'must_have': True},
-            {'id': 3, 'name': 'ROIC quality', 'code': 'ryq76', 'type': 'peer_percentile', 'direction': 'higher_better', 'threshold': 0.60, 'must_have': False},
-            {'id': 4, 'name': 'EBIT margin', 'code': 'ryq27', 'type': 'peer_percentile', 'direction': 'higher_better', 'threshold': 0.60, 'must_have': False},
-            {'id': 5, 'name': 'Profit growth YoY', 'code': 'ryq39', 'type': 'peer_percentile', 'direction': 'higher_better', 'threshold': 0.50, 'must_have': False},
-            {'id': 6, 'name': 'Revenue growth YoY', 'code': 'ryq34', 'type': 'peer_percentile', 'direction': 'higher_better', 'threshold': 0.50, 'must_have': False},
+            {'id': 1, 'name': 'ROE minimum', 'code': 'ryq12', 'type': 'absolute', 'direction': 'higher', 'threshold': 0.10, 'must_have': True},
+            {'id': 2, 'name': 'Net margin minimum', 'code': 'ryq29', 'type': 'absolute', 'direction': 'higher', 'threshold': 0.10, 'must_have': True},
+            {'id': 3, 'name': 'ROIC quality', 'code': 'ryq76', 'type': 'peer_percentile', 'direction': 'higher', 'cut': 0.60, 'must_have': False},
+            {'id': 4, 'name': 'EBIT margin', 'code': 'ryq27', 'type': 'peer_percentile', 'direction': 'higher', 'cut': 0.60, 'must_have': False},
+            {'id': 5, 'name': 'Profit growth YoY', 'code': 'ryq39', 'type': 'peer_percentile', 'direction': 'higher', 'cut': 0.50, 'must_have': False},
+            {'id': 6, 'name': 'Revenue growth YoY', 'code': 'ryq34', 'type': 'peer_percentile', 'direction': 'higher', 'cut': 0.50, 'must_have': False},
         ]
     
-    def get_metric_series(self, financial_df, code):
-        """Extract series of values for a metric code (last 12 quarters)"""
-        metric_data = financial_df[financial_df['code'] == code]
-        if len(metric_data) > 0:
-            values = metric_data['value'].dropna()
-            if len(values) > 0:
-                return values.tail(12)
-        return pd.Series(dtype=float)
-    
-    def get_metric_value(self, financial_df, code):
-        """Extract the latest value for a metric code"""
-        series = self.get_metric_series(financial_df, code)
-        return series.iloc[-1] if len(series) > 0 else None
+    def get_metric_series(self, financial_df, code, periods=12):
+        """Extract last N period values for a metric code"""
+        metric_data = financial_df[financial_df['code'] == code].copy()
+        if metric_data.empty:
+            return []
+
+        if 'date' in metric_data.columns:
+            metric_data = metric_data.sort_values('date')
+            metric_data['period_key'] = metric_data['date']
+        elif {'year', 'quarter'}.issubset(metric_data.columns):
+            metric_data = metric_data.sort_values(['year', 'quarter'])
+            metric_data['period_key'] = list(zip(metric_data['year'], metric_data['quarter']))
+        else:
+            metric_data = metric_data.reset_index().rename(columns={'index': 'period_key'})
+
+        metric_data = metric_data.dropna(subset=['value'])
+        if periods is not None:
+            metric_data = metric_data.tail(periods)
+
+        return list(metric_data[['period_key', 'value']].itertuples(index=False, name=None))
+
+    def get_metric_period_dict(self, financial_df, code):
+        """Map period_key -> value for a metric code"""
+        metric_data = financial_df[financial_df['code'] == code].copy()
+        if metric_data.empty:
+            return {}
+
+        if 'date' in metric_data.columns:
+            metric_data = metric_data.sort_values('date')
+            metric_data['period_key'] = metric_data['date']
+        elif {'year', 'quarter'}.issubset(metric_data.columns):
+            metric_data = metric_data.sort_values(['year', 'quarter'])
+            metric_data['period_key'] = list(zip(metric_data['year'], metric_data['quarter']))
+        else:
+            metric_data = metric_data.reset_index().rename(columns={'index': 'period_key'})
+
+        metric_data = metric_data.dropna(subset=['value'])
+        return dict(metric_data[['period_key', 'value']].itertuples(index=False, name=None))
     
     def evaluate_criterion(self, financial_df, criterion, all_financials_data):
-        """Evaluate a single criterion for a financial"""
+        """Evaluate a single criterion over the last 12 quarters (with pass rate ≥ 50%)"""
         try:
-            code = criterion['code']
             crit_type = criterion['type']
-            direction = criterion['direction']
-            
-            latest_value = self.get_metric_value(financial_df, code)
-            
-            if latest_value is None:
-                return {'pass': False, 'reason': f'Code {code} not found', 'value': None}
-            
-            # Absolute criterion
+
             if crit_type == 'absolute':
-                if direction == 'higher_better':
-                    pass_check = latest_value >= criterion['threshold']
+                series = self.get_metric_series(financial_df, criterion['code'], periods=12)
+                if not series:
+                    return {'pass': False, 'reason': f"Code {criterion['code']} not found", 'values': []}
+
+                values = [v for _, v in series]
+                if criterion['direction'] == 'lower':
+                    period_passes = [v <= criterion['threshold'] for v in values]
                 else:
-                    pass_check = latest_value <= criterion['threshold']
-                return {'pass': pass_check, 'value': latest_value, 'threshold': criterion['threshold']}
-            
-            # Peer percentile criterion
-            elif crit_type == 'peer_percentile':
-                peer_values = [self.get_metric_value(df, code) for df in all_financials_data.values()]
-                peer_values = [v for v in peer_values if v is not None]
-                if len(peer_values) > 0:
-                    if direction == 'lower_better':
-                        pct = sum(1 for v in peer_values if v >= latest_value) / len(peer_values)
-                        pass_check = pct <= criterion['threshold']
+                    period_passes = [v >= criterion['threshold'] for v in values]
+                
+                pass_rate = sum(period_passes) / len(period_passes) if period_passes else 0
+                is_passed = pass_rate >= 0.5
+                
+                return {
+                    'pass': is_passed,
+                    'pass_rate': pass_rate,
+                    'values': values,
+                    'threshold': criterion['threshold'],
+                    'periods_used': len(values)
+                }
+
+            if crit_type == 'peer_percentile':
+                series = self.get_metric_series(financial_df, criterion['code'], periods=12)
+                if not series:
+                    return {'pass': False, 'reason': 'No period values available', 'values': []}
+
+                period_values = {p: v for p, v in series}
+                peer_maps = [self.get_metric_period_dict(df, criterion['code']) for df in all_financials_data.values()]
+
+                period_passes = []
+                percentiles = []
+                for period_key, value in period_values.items():
+                    peer_values = [pm.get(period_key) for pm in peer_maps if pm.get(period_key) is not None]
+                    if not peer_values:
+                        period_passes.append(False)
+                        percentiles.append(None)
+                        continue
+
+                    if criterion['direction'] == 'lower':
+                        pct = (value <= pd.Series(peer_values)).sum() / len(peer_values)
+                        pass_check = pct <= criterion['cut']
                     else:
-                        pct = sum(1 for v in peer_values if v <= latest_value) / len(peer_values)
-                        pass_check = pct >= criterion['threshold']
-                    return {'pass': pass_check, 'value': latest_value, 'percentile': pct, 'threshold': criterion['threshold']}
-            
+                        pct = (value >= pd.Series(peer_values)).sum() / len(peer_values)
+                        pass_check = pct >= criterion['cut']
+
+                    period_passes.append(pass_check)
+                    percentiles.append(pct)
+                
+                pass_rate = sum(period_passes) / len(period_passes) if period_passes else 0
+                is_passed = pass_rate >= 0.5
+                
+                return {
+                    'pass': is_passed,
+                    'pass_rate': pass_rate,
+                    'values': list(period_values.values()),
+                    'percentiles': percentiles,
+                    'cut': criterion['cut'],
+                    'periods_used': len(period_values)
+                }
+
             return {'pass': False, 'reason': 'Unknown criterion type'}
         
         except Exception as e:
@@ -277,76 +384,117 @@ for idx, (symbol, financials_df) in enumerate(financials_ratios_data.items()):
 class SolvencyScorer:
     def __init__(self):
         self.criteria = [
-            {'id': 1, 'name': 'Debt/Equity cap', 'code': 'ryq10', 'type': 'absolute', 'direction': 'lower_better', 'threshold': 2.5, 'must_have': True},
-            {'id': 2, 'name': 'Interest coverage safety', 'code': 'ryq77', 'type': 'absolute', 'direction': 'higher_better', 'threshold': 2.0, 'must_have': True},
-            {'id': 3, 'name': 'Borrowings/Equity', 'code': 'ryq6', 'type': 'peer_percentile', 'direction': 'lower_better', 'threshold': 0.50, 'must_have': False},
-            {'id': 4, 'name': 'Financial leverage', 'code': 'ryq71', 'type': 'peer_percentile', 'direction': 'lower_better', 'threshold': 0.50, 'must_have': False},
-            {'id': 5, 'name': 'ROA floor', 'code': 'ryq14', 'type': 'peer_or_abs', 'direction': 'higher_better', 'abs_threshold': 0.02, 'must_have': False},
-            {'id': 6, 'name': 'Asset turnover', 'code': 'ryq31', 'type': 'peer_percentile', 'direction': 'higher_better', 'threshold': 0.50, 'must_have': False},
+            {'id': 1, 'name': 'Debt/Equity cap', 'code': 'ryq10', 'type': 'absolute', 'direction': 'lower', 'threshold': 2.5, 'must_have': True},
+            {'id': 2, 'name': 'Interest coverage safety', 'code': 'ryq77', 'type': 'absolute', 'direction': 'higher', 'threshold': 2.0, 'must_have': True},
+            {'id': 3, 'name': 'Borrowings/Equity', 'code': 'ryq6', 'type': 'peer_percentile', 'direction': 'lower', 'cut': 0.50, 'must_have': False},
+            {'id': 4, 'name': 'Financial leverage', 'code': 'ryq71', 'type': 'peer_percentile', 'direction': 'lower', 'cut': 0.50, 'must_have': False},
+            {'id': 5, 'name': 'ROA floor', 'code': 'ryq14', 'type': 'absolute', 'direction': 'higher', 'threshold': 0.02, 'must_have': False},
+            {'id': 6, 'name': 'Asset turnover', 'code': 'ryq31', 'type': 'peer_percentile', 'direction': 'higher', 'cut': 0.50, 'must_have': False},
         ]
 
-    def get_metric_series(self, financial_df, code):
-        metric_data = financial_df[financial_df['code'] == code]
-        if len(metric_data) > 0:
-            values = metric_data['value'].dropna()
-            if len(values) > 0:
-                return values.tail(12)
-        return pd.Series(dtype=float)
+    def get_metric_series(self, financial_df, code, periods=12):
+        """Extract last N period values for a metric code"""
+        metric_data = financial_df[financial_df['code'] == code].copy()
+        if metric_data.empty:
+            return []
 
-    def get_metric_value(self, financial_df, code):
-        series = self.get_metric_series(financial_df, code)
-        return series.iloc[-1] if len(series) > 0 else None
+        if 'date' in metric_data.columns:
+            metric_data = metric_data.sort_values('date')
+            metric_data['period_key'] = metric_data['date']
+        elif {'year', 'quarter'}.issubset(metric_data.columns):
+            metric_data = metric_data.sort_values(['year', 'quarter'])
+            metric_data['period_key'] = list(zip(metric_data['year'], metric_data['quarter']))
+        else:
+            metric_data = metric_data.reset_index().rename(columns={'index': 'period_key'})
+
+        metric_data = metric_data.dropna(subset=['value'])
+        if periods is not None:
+            metric_data = metric_data.tail(periods)
+
+        return list(metric_data[['period_key', 'value']].itertuples(index=False, name=None))
+
+    def get_metric_period_dict(self, financial_df, code):
+        """Map period_key -> value for a metric code"""
+        metric_data = financial_df[financial_df['code'] == code].copy()
+        if metric_data.empty:
+            return {}
+
+        if 'date' in metric_data.columns:
+            metric_data = metric_data.sort_values('date')
+            metric_data['period_key'] = metric_data['date']
+        elif {'year', 'quarter'}.issubset(metric_data.columns):
+            metric_data = metric_data.sort_values(['year', 'quarter'])
+            metric_data['period_key'] = list(zip(metric_data['year'], metric_data['quarter']))
+        else:
+            metric_data = metric_data.reset_index().rename(columns={'index': 'period_key'})
+
+        metric_data = metric_data.dropna(subset=['value'])
+        return dict(metric_data[['period_key', 'value']].itertuples(index=False, name=None))
 
     def evaluate_criterion(self, financial_df, criterion, all_financials_data):
+        """Evaluate a single criterion over the last 12 quarters (with pass rate ≥ 50%)"""
         try:
-            code = criterion['code']
             crit_type = criterion['type']
-            direction = criterion['direction']
-
-            latest_value = self.get_metric_value(financial_df, code)
-
-            if latest_value is None:
-                return {'pass': False, 'reason': f'Code {code} not found', 'value': None}
 
             if crit_type == 'absolute':
-                if direction == 'higher_better':
-                    pass_check = latest_value >= criterion['threshold']
+                series = self.get_metric_series(financial_df, criterion['code'], periods=12)
+                if not series:
+                    return {'pass': False, 'reason': f"Code {criterion['code']} not found", 'values': []}
+
+                values = [v for _, v in series]
+                if criterion['direction'] == 'lower':
+                    period_passes = [v <= criterion['threshold'] for v in values]
                 else:
-                    pass_check = latest_value <= criterion['threshold']
-                return {'pass': pass_check, 'value': latest_value, 'threshold': criterion.get('threshold')}
+                    period_passes = [v >= criterion['threshold'] for v in values]
+                
+                pass_rate = sum(period_passes) / len(period_passes) if period_passes else 0
+                is_passed = pass_rate >= 0.5
+                
+                return {
+                    'pass': is_passed,
+                    'pass_rate': pass_rate,
+                    'values': values,
+                    'threshold': criterion['threshold'],
+                    'periods_used': len(values)
+                }
 
             elif crit_type == 'peer_percentile':
-                peer_values = [self.get_metric_value(df, code) for df in all_financials_data.values()]
-                peer_values = [v for v in peer_values if v is not None]
-                if len(peer_values) > 0:
-                    if direction == 'lower_better':
-                        pct = sum(1 for v in peer_values if v >= latest_value) / len(peer_values)
-                        pass_check = pct <= criterion['threshold']
+                series = self.get_metric_series(financial_df, criterion['code'], periods=12)
+                if not series:
+                    return {'pass': False, 'reason': 'No period values available', 'values': []}
+
+                period_values = {p: v for p, v in series}
+                peer_maps = [self.get_metric_period_dict(df, criterion['code']) for df in all_financials_data.values()]
+
+                period_passes = []
+                percentiles = []
+                for period_key, value in period_values.items():
+                    peer_values = [pm.get(period_key) for pm in peer_maps if pm.get(period_key) is not None]
+                    if not peer_values:
+                        period_passes.append(False)
+                        percentiles.append(None)
+                        continue
+
+                    if criterion['direction'] == 'lower':
+                        pct = (value <= pd.Series(peer_values)).sum() / len(peer_values)
+                        pass_check = pct <= criterion['cut']
                     else:
-                        pct = sum(1 for v in peer_values if v <= latest_value) / len(peer_values)
-                        pass_check = pct >= criterion['threshold']
-                    return {'pass': pass_check, 'value': latest_value, 'percentile': pct, 'threshold': criterion['threshold']}
+                        pct = (value >= pd.Series(peer_values)).sum() / len(peer_values)
+                        pass_check = pct >= criterion['cut']
 
-            elif crit_type == 'peer_or_abs':
-                peer_values = [self.get_metric_value(df, code) for df in all_financials_data.values()]
-                peer_values = [v for v in peer_values if v is not None]
-
-                abs_pass = latest_value >= criterion.get('abs_threshold', 0)
-                peer_pass = False
-                peer_median = None
-                if len(peer_values) > 0:
-                    sorted_peers = sorted(peer_values)
-                    peer_median = sorted_peers[len(sorted_peers) // 2]
-                    peer_pass = latest_value >= peer_median if direction == 'higher_better' else latest_value <= peer_median
-
-                pass_check = abs_pass or peer_pass
+                    period_passes.append(pass_check)
+                    percentiles.append(pct)
+                
+                pass_rate = sum(period_passes) / len(period_passes) if period_passes else 0
+                is_passed = pass_rate >= 0.5
+                
                 return {
-                    'pass': pass_check,
-                    'value': latest_value,
-                    'abs_threshold': criterion.get('abs_threshold'),
-                    'peer_median': peer_median,
-                    'abs_pass': abs_pass,
-                    'peer_pass': peer_pass,
+                    'pass': is_passed,
+                    'pass_rate': pass_rate,
+                    'values': list(period_values.values()),
+                    'percentiles': percentiles,
+                    'cut': criterion['cut'],
+                    'periods_used': len(period_values)
                 }
 
             return {'pass': False, 'reason': 'Unknown criterion type'}
@@ -564,3 +712,4 @@ except Exception as e:
     import traceback
     traceback.print_exc()
     combined_scores_draft = pd.DataFrame()
+# %%

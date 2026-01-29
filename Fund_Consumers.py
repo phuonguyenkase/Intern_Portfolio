@@ -70,15 +70,6 @@ except Exception as e:
 print(consumers_symbols)
 
 # %%
-CODE_MAPPING = {
-    'ryq3': 'Current Ratio',
-    'ryq2': 'Quick Ratio',
-    'ryq1': 'Cash Ratio',
-    'ryq16': 'DSO Control',
-    'ryq18': 'Inventory Control (DIO)',
-    'ryq20': 'Payable efficiency (DPO)',
-}
-
 class LiquidityScorer:
     def __init__(self):
         self.criteria = [
@@ -91,87 +82,130 @@ class LiquidityScorer:
             {'id': 7, 'name': 'Cash Conversion Cycle (CCC)', 'type': 'calculated_peer_percentile', 'formula': 'DSO + DIO - DPO', 'codes': ['ryq16', 'ryq18', 'ryq20'], 'rule': 'pct ≤ 0.50', 'cut': 0.50, 'direction': 'lower', 'must_have': False},
         ]
     
-    def get_metric_value(self, consumers_df, code):
-        """Extract the latest value for a metric code"""
+    def get_metric_series(self, consumers_df, code, periods=12):
+        """Extract last N period values for a metric code"""
         metric_data = consumers_df[consumers_df['code'] == code].copy()
-        if len(metric_data) > 0:
-            # Ensure latest means most recent quarter; sort then take last
-            if 'date' in metric_data.columns:
-                metric_data = metric_data.sort_values('date')
-            elif {'year', 'quarter'}.issubset(metric_data.columns):
-                metric_data = metric_data.sort_values(['year', 'quarter'])
-            series = metric_data['value'].dropna()
-            return series.iloc[-1] if len(series) > 0 else None
-        return None
-    
-    def calculate_ccc(self, consumers_df):
-        """Calculate Cash Conversion Cycle: DSO + DIO - DPO"""
-        dso = self.get_metric_value(consumers_df, 'ryq16')
-        dio = self.get_metric_value(consumers_df, 'ryq18')
-        dpo = self.get_metric_value(consumers_df, 'ryq20')
-        
-        if dso is None or dio is None or dpo is None:
-            return None
-        
-        return dso + dio - dpo
+        if metric_data.empty:
+            return []
+
+        if 'date' in metric_data.columns:
+            metric_data = metric_data.sort_values('date')
+            metric_data['period_key'] = metric_data['date']
+        elif {'year', 'quarter'}.issubset(metric_data.columns):
+            metric_data = metric_data.sort_values(['year', 'quarter'])
+            metric_data['period_key'] = list(zip(metric_data['year'], metric_data['quarter']))
+        else:
+            metric_data = metric_data.reset_index().rename(columns={'index': 'period_key'})
+
+        metric_data = metric_data.dropna(subset=['value'])
+        if periods is not None:
+            metric_data = metric_data.tail(periods)
+
+        return list(metric_data[['period_key', 'value']].itertuples(index=False, name=None))
+
+    def get_metric_period_dict(self, consumers_df, code):
+        """Map period_key -> value for a metric code"""
+        metric_data = consumers_df[consumers_df['code'] == code].copy()
+        if metric_data.empty:
+            return {}
+
+        if 'date' in metric_data.columns:
+            metric_data = metric_data.sort_values('date')
+            metric_data['period_key'] = metric_data['date']
+        elif {'year', 'quarter'}.issubset(metric_data.columns):
+            metric_data = metric_data.sort_values(['year', 'quarter'])
+            metric_data['period_key'] = list(zip(metric_data['year'], metric_data['quarter']))
+        else:
+            metric_data = metric_data.reset_index().rename(columns={'index': 'period_key'})
+
+        metric_data = metric_data.dropna(subset=['value'])
+        return dict(metric_data[['period_key', 'value']].itertuples(index=False, name=None))
     
     def evaluate_criterion(self, consumers_df, criterion, all_companies_data):
-        """Evaluate a single criterion for a consumers"""
+        """Evaluate a single criterion over the last 12 quarters (with pass rate ≥ 50%)"""
         try:
             crit_type = criterion['type']
-            
-            # Calculated peer percentile (CCC)
-            if crit_type == 'calculated_peer_percentile':
-                latest_value = self.calculate_ccc(consumers_df)
-                
-                if latest_value is None:
-                    return {'pass': False, 'reason': 'CCC calculation failed (missing DSO/DIO/DPO)', 'value': None}
-                
-                # Calculate CCC for all peers
-                peer_values = []
-                for df in all_companies_data.values():
-                    peer_ccc = self.calculate_ccc(df)
-                    if peer_ccc is not None:
-                        peer_values.append(peer_ccc)
-                
-                if len(peer_values) > 0:
-                    if criterion['direction'] == 'lower':
-                        pct = sum(1 for v in peer_values if latest_value <= v) / len(peer_values)
-                        pass_check = pct <= criterion['cut']
-                    else:
-                        pct = sum(1 for v in peer_values if latest_value >= v) / len(peer_values)
-                        pass_check = pct >= criterion['cut']
-                    return {'pass': pass_check, 'value': latest_value, 'percentile': pct, 'cut': criterion['cut']}
-                else:
-                    return {'pass': False, 'reason': 'No peer CCC values available', 'value': latest_value}
-            
-            code = criterion['code']
-            latest_value = self.get_metric_value(consumers_df, code)
-            
-            if latest_value is None:
-                return {'pass': False, 'reason': f'Code {code} not found', 'value': None}
-            
-            # Absolute criterion
+
             if crit_type == 'absolute':
+                series = self.get_metric_series(consumers_df, criterion['code'], periods=12)
+                if not series:
+                    return {'pass': False, 'reason': f"Code {criterion['code']} not found", 'values': []}
+
+                values = [v for _, v in series]
                 if criterion['direction'] == 'lower':
-                    pass_check = latest_value <= criterion['threshold']
+                    period_passes = [v <= criterion['threshold'] for v in values]
                 else:
-                    pass_check = latest_value >= criterion['threshold']
-                return {'pass': pass_check, 'value': latest_value, 'threshold': criterion['threshold']}
-            
-            # Peer percentile criterion
-            elif crit_type == 'peer_percentile':
-                peer_values = [self.get_metric_value(df, code) for df in all_companies_data.values()]
-                peer_values = [v for v in peer_values if v is not None]
-                if len(peer_values) > 0:
+                    period_passes = [v >= criterion['threshold'] for v in values]
+                
+                pass_rate = sum(period_passes) / len(period_passes) if period_passes else 0
+                is_passed = pass_rate >= 0.5
+                
+                return {
+                    'pass': is_passed,
+                    'pass_rate': pass_rate,
+                    'values': values,
+                    'threshold': criterion['threshold'],
+                    'periods_used': len(values)
+                }
+
+            if crit_type in {'peer_percentile', 'calculated_peer_percentile'}:
+                if crit_type == 'calculated_peer_percentile':
+                    # For CCC: calculate DSO, DIO, DPO and combine
+                    dso_series = self.get_metric_series(consumers_df, 'ryq16', periods=12)
+                    dio_series = self.get_metric_series(consumers_df, 'ryq18', periods=12)
+                    dpo_series = self.get_metric_series(consumers_df, 'ryq20', periods=12)
+                    
+                    if not dso_series or not dio_series or not dpo_series:
+                        return {'pass': False, 'reason': 'Missing DSO/DIO/DPO data', 'values': []}
+                    
+                    dso_dict = {p: v for p, v in dso_series}
+                    dio_dict = {p: v for p, v in dio_series}
+                    dpo_dict = {p: v for p, v in dpo_series}
+                    
+                    common_periods = set(dso_dict.keys()) & set(dio_dict.keys()) & set(dpo_dict.keys())
+                    if not common_periods:
+                        return {'pass': False, 'reason': 'No common periods', 'values': []}
+                    
+                    period_values = {p: dso_dict[p] + dio_dict[p] - dpo_dict[p] for p in common_periods}
+                else:
+                    series = self.get_metric_series(consumers_df, criterion['code'], periods=12)
+                    if not series:
+                        return {'pass': False, 'reason': 'No period values available', 'values': []}
+                    period_values = {p: v for p, v in series}
+
+                peer_maps = [self.get_metric_period_dict(df, criterion['code']) for df in all_companies_data.values()]
+
+                period_passes = []
+                percentiles = []
+                for period_key, value in period_values.items():
+                    peer_values = [pm.get(period_key) for pm in peer_maps if pm.get(period_key) is not None]
+                    if not peer_values:
+                        period_passes.append(False)
+                        percentiles.append(None)
+                        continue
+
                     if criterion['direction'] == 'lower':
-                        pct = (latest_value <= pd.Series(peer_values)).sum() / len(peer_values)
+                        pct = (value <= pd.Series(peer_values)).sum() / len(peer_values)
                         pass_check = pct <= criterion['cut']
                     else:
-                        pct = (latest_value >= pd.Series(peer_values)).sum() / len(peer_values)
+                        pct = (value >= pd.Series(peer_values)).sum() / len(peer_values)
                         pass_check = pct >= criterion['cut']
-                    return {'pass': pass_check, 'value': latest_value, 'percentile': pct, 'cut': criterion['cut']}
-            
+
+                    period_passes.append(pass_check)
+                    percentiles.append(pct)
+                
+                pass_rate = sum(period_passes) / len(period_passes) if period_passes else 0
+                is_passed = pass_rate >= 0.5
+                
+                return {
+                    'pass': is_passed,
+                    'pass_rate': pass_rate,
+                    'values': list(period_values.values()),
+                    'percentiles': percentiles,
+                    'cut': criterion['cut'],
+                    'periods_used': len(period_values)
+                }
+
             return {'pass': False, 'reason': 'Unknown criterion type'}
         
         except Exception as e:
@@ -227,50 +261,111 @@ class ProfitabilityScorer:
             {'id': 6, 'name': 'Revenue growth', 'code': 'ryq34', 'type': 'peer_percentile', 'rule': 'pct ≥ 0.50', 'cut': 0.50, 'direction': 'higher', 'must_have': False},
         ]
     
-    def get_metric_value(self, consumers_df, code):
-        """Extract the latest value for a metric code"""
+    def get_metric_series(self, consumers_df, code, periods=12):
+        """Extract last N period values for a metric code"""
         metric_data = consumers_df[consumers_df['code'] == code].copy()
-        if len(metric_data) > 0:
-            if 'date' in metric_data.columns:
-                metric_data = metric_data.sort_values('date')
-            elif {'year', 'quarter'}.issubset(metric_data.columns):
-                metric_data = metric_data.sort_values(['year', 'quarter'])
-            series = metric_data['value'].dropna()
-            return series.iloc[-1] if len(series) > 0 else None
-        return None
+        if metric_data.empty:
+            return []
+
+        if 'date' in metric_data.columns:
+            metric_data = metric_data.sort_values('date')
+            metric_data['period_key'] = metric_data['date']
+        elif {'year', 'quarter'}.issubset(metric_data.columns):
+            metric_data = metric_data.sort_values(['year', 'quarter'])
+            metric_data['period_key'] = list(zip(metric_data['year'], metric_data['quarter']))
+        else:
+            metric_data = metric_data.reset_index().rename(columns={'index': 'period_key'})
+
+        metric_data = metric_data.dropna(subset=['value'])
+        if periods is not None:
+            metric_data = metric_data.tail(periods)
+
+        return list(metric_data[['period_key', 'value']].itertuples(index=False, name=None))
+    
+    def get_metric_period_dict(self, consumers_df, code):
+        """Map period_key -> value for a metric code"""
+        metric_data = consumers_df[consumers_df['code'] == code].copy()
+        if metric_data.empty:
+            return {}
+
+        if 'date' in metric_data.columns:
+            metric_data = metric_data.sort_values('date')
+            metric_data['period_key'] = metric_data['date']
+        elif {'year', 'quarter'}.issubset(metric_data.columns):
+            metric_data = metric_data.sort_values(['year', 'quarter'])
+            metric_data['period_key'] = list(zip(metric_data['year'], metric_data['quarter']))
+        else:
+            metric_data = metric_data.reset_index().rename(columns={'index': 'period_key'})
+
+        metric_data = metric_data.dropna(subset=['value'])
+        return dict(metric_data[['period_key', 'value']].itertuples(index=False, name=None))
     
     def evaluate_criterion(self, consumers_df, criterion, all_companies_data):
-        """Evaluate a single criterion for a consumers"""
+        """Evaluate a single criterion over the last 12 quarters (with pass rate ≥ 50%)"""
         try:
-            code = criterion['code']
             crit_type = criterion['type']
-            
-            latest_value = self.get_metric_value(consumers_df, code)
-            
-            if latest_value is None:
-                return {'pass': False, 'reason': f'Code {code} not found', 'value': None}
-            
-            # Absolute criterion
+
             if crit_type == 'absolute':
+                series = self.get_metric_series(consumers_df, criterion['code'], periods=12)
+                if not series:
+                    return {'pass': False, 'reason': f"Code {criterion['code']} not found", 'values': []}
+
+                values = [v for _, v in series]
                 if criterion['direction'] == 'lower':
-                    pass_check = latest_value <= criterion['threshold']
+                    period_passes = [v <= criterion['threshold'] for v in values]
                 else:
-                    pass_check = latest_value >= criterion['threshold']
-                return {'pass': pass_check, 'value': latest_value, 'threshold': criterion['threshold']}
-            
-            # Peer percentile criterion
-            elif crit_type == 'peer_percentile':
-                peer_values = [self.get_metric_value(df, code) for df in all_companies_data.values()]
-                peer_values = [v for v in peer_values if v is not None]
-                if len(peer_values) > 0:
+                    period_passes = [v >= criterion['threshold'] for v in values]
+                
+                pass_rate = sum(period_passes) / len(period_passes) if period_passes else 0
+                is_passed = pass_rate >= 0.5
+                
+                return {
+                    'pass': is_passed,
+                    'pass_rate': pass_rate,
+                    'values': values,
+                    'threshold': criterion['threshold'],
+                    'periods_used': len(values)
+                }
+
+            if crit_type == 'peer_percentile':
+                series = self.get_metric_series(consumers_df, criterion['code'], periods=12)
+                if not series:
+                    return {'pass': False, 'reason': 'No period values available', 'values': []}
+
+                period_values = {p: v for p, v in series}
+                peer_maps = [self.get_metric_period_dict(df, criterion['code']) for df in all_companies_data.values()]
+
+                period_passes = []
+                percentiles = []
+                for period_key, value in period_values.items():
+                    peer_values = [pm.get(period_key) for pm in peer_maps if pm.get(period_key) is not None]
+                    if not peer_values:
+                        period_passes.append(False)
+                        percentiles.append(None)
+                        continue
+
                     if criterion['direction'] == 'lower':
-                        pct = sum(1 for v in peer_values if latest_value <= v) / len(peer_values)
+                        pct = (value <= pd.Series(peer_values)).sum() / len(peer_values)
                         pass_check = pct <= criterion['cut']
                     else:
-                        pct = sum(1 for v in peer_values if latest_value >= v) / len(peer_values)
+                        pct = (value >= pd.Series(peer_values)).sum() / len(peer_values)
                         pass_check = pct >= criterion['cut']
-                    return {'pass': pass_check, 'value': latest_value, 'percentile': pct, 'cut': criterion['cut']}
-            
+
+                    period_passes.append(pass_check)
+                    percentiles.append(pct)
+                
+                pass_rate = sum(period_passes) / len(period_passes) if period_passes else 0
+                is_passed = pass_rate >= 0.5
+                
+                return {
+                    'pass': is_passed,
+                    'pass_rate': pass_rate,
+                    'values': list(period_values.values()),
+                    'percentiles': percentiles,
+                    'cut': criterion['cut'],
+                    'periods_used': len(period_values)
+                }
+
             return {'pass': False, 'reason': 'Unknown criterion type'}
         
         except Exception as e:
@@ -326,91 +421,135 @@ class SolvencyScorer:
             {'id': 6, 'name': 'Fixed asset turnover', 'code': 'ryq91', 'type': 'peer_percentile', 'rule': 'pct ≥ 0.50', 'cut': 0.50, 'direction': 'higher', 'must_have': False},
         ]
     
-    def get_metric_value(self, consumers_df, code):
-        """Extract the latest value for a metric code"""
+    def get_metric_series(self, consumers_df, code, periods=12):
+        """Extract last N period values for a metric code"""
         metric_data = consumers_df[consumers_df['code'] == code].copy()
-        if len(metric_data) > 0:
-            if 'date' in metric_data.columns:
-                metric_data = metric_data.sort_values('date')
-            elif {'year', 'quarter'}.issubset(metric_data.columns):
-                metric_data = metric_data.sort_values(['year', 'quarter'])
-            series = metric_data['value'].dropna()
-            return series.iloc[-1] if len(series) > 0 else None
-        return None
+        if metric_data.empty:
+            return []
+
+        if 'date' in metric_data.columns:
+            metric_data = metric_data.sort_values('date')
+            metric_data['period_key'] = metric_data['date']
+        elif {'year', 'quarter'}.issubset(metric_data.columns):
+            metric_data = metric_data.sort_values(['year', 'quarter'])
+            metric_data['period_key'] = list(zip(metric_data['year'], metric_data['quarter']))
+        else:
+            metric_data = metric_data.reset_index().rename(columns={'index': 'period_key'})
+
+        metric_data = metric_data.dropna(subset=['value'])
+        if periods is not None:
+            metric_data = metric_data.tail(periods)
+
+        return list(metric_data[['period_key', 'value']].itertuples(index=False, name=None))
     
-    def get_metric_series(self, consumers_df, code):
-        """Extract last 12 quarters for a metric code as a series"""
+    def get_metric_period_dict(self, consumers_df, code):
+        """Map period_key -> value for a metric code"""
         metric_data = consumers_df[consumers_df['code'] == code].copy()
-        if len(metric_data) > 0:
-            if 'date' in metric_data.columns:
-                metric_data = metric_data.sort_values('date')
-            elif {'year', 'quarter'}.issubset(metric_data.columns):
-                metric_data = metric_data.sort_values(['year', 'quarter'])
-            series = metric_data['value'].dropna()
-            return series.tail(12)
-        return pd.Series()
+        if metric_data.empty:
+            return {}
+
+        if 'date' in metric_data.columns:
+            metric_data = metric_data.sort_values('date')
+            metric_data['period_key'] = metric_data['date']
+        elif {'year', 'quarter'}.issubset(metric_data.columns):
+            metric_data = metric_data.sort_values(['year', 'quarter'])
+            metric_data['period_key'] = list(zip(metric_data['year'], metric_data['quarter']))
+        else:
+            metric_data = metric_data.reset_index().rename(columns={'index': 'period_key'})
+
+        metric_data = metric_data.dropna(subset=['value'])
+        return dict(metric_data[['period_key', 'value']].itertuples(index=False, name=None))
     
     def evaluate_criterion(self, consumers_df, criterion, all_companies_data):
-        """Evaluate a single criterion for a consumers company"""
+        """Evaluate a single criterion over the last 12 quarters (with pass rate ≥ 50%)"""
         try:
             crit_type = criterion['type']
             
             # Absolute criterion
             if crit_type == 'absolute':
-                code = criterion['code']
-                latest_value = self.get_metric_value(consumers_df, code)
-                
-                if latest_value is None:
-                    return {'pass': False, 'reason': f'Code {code} not found', 'value': None}
-                
+                series = self.get_metric_series(consumers_df, criterion['code'], periods=12)
+                if not series:
+                    return {'pass': False, 'reason': f"Code {criterion['code']} not found", 'values': []}
+
+                values = [v for _, v in series]
                 if criterion['direction'] == 'lower':
-                    pass_check = latest_value <= criterion['threshold']
+                    period_passes = [v <= criterion['threshold'] for v in values]
                 else:
-                    pass_check = latest_value >= criterion['threshold']
-                return {'pass': pass_check, 'value': latest_value, 'threshold': criterion['threshold']}
+                    period_passes = [v >= criterion['threshold'] for v in values]
+                
+                pass_rate = sum(period_passes) / len(period_passes) if period_passes else 0
+                is_passed = pass_rate >= 0.5
+                
+                return {
+                    'pass': is_passed,
+                    'pass_rate': pass_rate,
+                    'values': values,
+                    'threshold': criterion['threshold'],
+                    'periods_used': len(values)
+                }
             
             # Peer percentile criterion
             elif crit_type == 'peer_percentile':
-                code = criterion['code']
-                latest_value = self.get_metric_value(consumers_df, code)
-                
-                if latest_value is None:
-                    return {'pass': False, 'reason': f'Code {code} not found', 'value': None}
-                
-                peer_values = [self.get_metric_value(df, code) for df in all_companies_data.values()]
-                peer_values = [v for v in peer_values if v is not None]
-                if len(peer_values) > 0:
+                series = self.get_metric_series(consumers_df, criterion['code'], periods=12)
+                if not series:
+                    return {'pass': False, 'reason': 'No period values available', 'values': []}
+
+                period_values = {p: v for p, v in series}
+                peer_maps = [self.get_metric_period_dict(df, criterion['code']) for df in all_companies_data.values()]
+
+                period_passes = []
+                percentiles = []
+                for period_key, value in period_values.items():
+                    peer_values = [pm.get(period_key) for pm in peer_maps if pm.get(period_key) is not None]
+                    if not peer_values:
+                        period_passes.append(False)
+                        percentiles.append(None)
+                        continue
+
                     if criterion['direction'] == 'lower':
-                        pct = sum(1 for v in peer_values if latest_value <= v) / len(peer_values)
+                        pct = (value <= pd.Series(peer_values)).sum() / len(peer_values)
                         pass_check = pct <= criterion['cut']
                     else:
-                        pct = sum(1 for v in peer_values if latest_value >= v) / len(peer_values)
+                        pct = (value >= pd.Series(peer_values)).sum() / len(peer_values)
                         pass_check = pct >= criterion['cut']
-                    return {'pass': pass_check, 'value': latest_value, 'percentile': pct, 'cut': criterion['cut']}
+
+                    period_passes.append(pass_check)
+                    percentiles.append(pct)
+                
+                pass_rate = sum(period_passes) / len(period_passes) if period_passes else 0
+                is_passed = pass_rate >= 0.5
+                
+                return {
+                    'pass': is_passed,
+                    'pass_rate': pass_rate,
+                    'values': list(period_values.values()),
+                    'percentiles': percentiles,
+                    'cut': criterion['cut'],
+                    'periods_used': len(period_values)
+                }
             
             # Trend volatility criterion (ROA stability)
             elif crit_type == 'trend_vol':
                 code = criterion['code']
-                metric_series = self.get_metric_series(consumers_df, code)
+                series_list = self.get_metric_series(consumers_df, code, periods=criterion['window'])
                 
-                if len(metric_series) < criterion['window']:
+                if len(series_list) < criterion['window']:
                     return {'pass': False, 'reason': f'Insufficient data for {code}', 'value': None}
                 
-                # Get recent window
-                recent_data = metric_series.tail(criterion['window'])
-                std_val = recent_data.std()
+                values = [v for _, v in series_list]
+                std_val = pd.Series(values).std()
                 
                 # Compare to peer median std
                 peer_stds = []
                 for df in all_companies_data.values():
-                    peer_series = self.get_metric_series(df, code)
-                    if len(peer_series) >= criterion['window']:
-                        peer_std = peer_series.tail(criterion['window']).std()
+                    peer_series_list = self.get_metric_series(df, code, periods=criterion['window'])
+                    if len(peer_series_list) >= criterion['window']:
+                        peer_values = [v for _, v in peer_series_list]
+                        peer_std = pd.Series(peer_values).std()
                         peer_stds.append(peer_std)
                 
                 if len(peer_stds) > 0:
-                    sorted_stds = sorted(peer_stds)
-                    peer_median_std = sorted_stds[len(sorted_stds) // 2]
+                    peer_median_std = pd.Series(peer_stds).median()
                     pass_check = std_val <= peer_median_std
                     return {'pass': pass_check, 'std': std_val, 'peer_median_std': peer_median_std}
                 else:
@@ -633,3 +772,4 @@ except Exception as e:
     import traceback
     traceback.print_exc()
     combined_scores_draft = pd.DataFrame()
+# %%
