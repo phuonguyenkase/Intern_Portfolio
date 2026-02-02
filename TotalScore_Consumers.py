@@ -1,6 +1,6 @@
 # %%
 import pandas as pd
-import TechAna_DRAFT as TechAna
+import TechAna
 
 START_DATE = "2025-09-01"
 END_DATE = "2025-12-31"
@@ -24,7 +24,10 @@ if symbols_to_analyze:
     tech_scores, foreign_scores, risk_scores = TechAna.analyze_symbols(
         symbols_to_analyze, 
         START_DATE, 
-        END_DATE)
+        END_DATE,
+        industry='Consumer Staples',
+        year=2025,
+        quarter=3)
 
     fund_map = dict(zip(df_final['Symbol'], df_final['Total_Score']))
 

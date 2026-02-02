@@ -1,12 +1,10 @@
 # %%
 import pandas as pd
 import TechAna
-
-START_DATE = "2025-09-01"
-END_DATE = "2025-12-31"
+from TechAna import START_DATE, END_DATE
 
 try:
-    from Fund_HealthCare import combined_scores_draft as df_final
+    from Fund_RealEstate import combined_scores_draft as df_final
     print("Success")
 except ImportError:
     print("ERROR")
@@ -20,12 +18,12 @@ else:
 
 # %%
 if symbols_to_analyze:
-    print(f"Running comprehensive analysis for {len(symbols_to_analyze)}  Health Care symbols...")
+    print(f"Running comprehensive analysis for {len(symbols_to_analyze)} Real Estate symbols...")
     tech_scores, foreign_scores, risk_scores = TechAna.analyze_symbols(
         symbols_to_analyze, 
         START_DATE, 
         END_DATE,
-        industry='Health Care',
+        industry='Real Estate',
         year=2025,
         quarter=3)
 
@@ -49,9 +47,9 @@ if symbols_to_analyze:
     df_total = pd.DataFrame(final_rows)
     
     W_FUND = 0.3
-    W_TECH = 0.4
+    W_TECH = 0.45
     W_FOREIGN = 0.1
-    W_RISK = 0.20
+    W_RISK = 0.15
 
     df_total['Final_Score'] = (
         W_FUND * (df_total['Fund_Score']) +
@@ -64,11 +62,9 @@ if symbols_to_analyze:
     df_total = df_total.sort_values(by='Final_Score', ascending=False).reset_index(drop=True)
     df_total['Rank'] = df_total.index + 1
 
-    # Làm tròn số hiển thị
     cols_to_round = ['Final_Score']
     df_total[cols_to_round] = df_total[cols_to_round].round(2)
 
-    # Đổi tên cột hiển thị cho đẹp
     display_df = df_total[[
         'Rank', 'Symbol', 
         'Fund_Score',
@@ -78,7 +74,7 @@ if symbols_to_analyze:
         'Final_Score'
     ]]
 
-    print("Summary Score for Health Care:")
+    print("Summary Score for Real Estate:")
     
 else:
     print("Không có dữ liệu để tổng hợp.")

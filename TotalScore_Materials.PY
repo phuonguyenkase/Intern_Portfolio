@@ -1,6 +1,6 @@
 # %%
 import pandas as pd
-import TechAna_DRAFT as TechAna
+import TechAna
 
 START_DATE = "2025-09-01"
 END_DATE = "2025-12-31"
@@ -25,12 +25,16 @@ if symbols_to_analyze:
     tech_scores, foreign_scores, risk_scores = TechAna.analyze_symbols(
         symbols_to_analyze, 
         START_DATE, 
-        END_DATE)
+        END_DATE,
+        industry='Materials',
+        year=2025,
+        quarter=3)
 
     stock_data = TechAna.APIFetcher.fetch_batch(
         "http://192.168.8.190:8000/MKD/stock_daily", 
         symbols_to_analyze, START_DATE, END_DATE
     )
+
     risk_records = TechAna.calculate_risk_metrics_batch(symbols_to_analyze, stock_data)
     risk_map = {r['symbol']: r for r in risk_records}
     
@@ -90,10 +94,10 @@ if symbols_to_analyze:
 
     df_total = pd.DataFrame(final_rows)
     
-    W_FUND = 0.3
-    W_TECH = 0.4
-    W_FOREIGN = 0.1
-    W_RISK = 0.2
+    W_FUND = 0.25
+    W_TECH = 0.35
+    W_FOREIGN = 0.25
+    W_RISK = 0.15
 
     df_total['Final_Score'] = (
         W_FUND * (df_total['Fund_Score']) +
@@ -127,4 +131,3 @@ else:
 
 # %%
 print(display_df.to_string(index=False))
-# %%

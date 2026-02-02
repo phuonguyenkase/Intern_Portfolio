@@ -1,6 +1,6 @@
 # %%
 import pandas as pd
-import TechAna_DRAFT as TechAna
+import TechAna
 import RiskControl_Fin as RiskControl
 
 START_DATE = "2025-09-01"
@@ -25,12 +25,15 @@ if symbols_to_analyze:
     tech_scores, foreign_scores, _ = TechAna.analyze_symbols(
         symbols_to_analyze, 
         START_DATE, 
-        END_DATE)
+        END_DATE,
+        industry='Financials',
+        year=2025,
+        quarter=3)
 
     fund_map = dict(zip(df_final['Symbol'], df_final['Total_Score']))
     
     # Use risk_scores from RiskControl_Fin
-    from TechAna_DRAFT import APIFetcher
+    from TechAna import APIFetcher
     stock_data = APIFetcher.fetch_batch(
         "http://192.168.8.190:8000/MKD/stock_daily", 
         symbols_to_analyze, START_DATE, END_DATE
