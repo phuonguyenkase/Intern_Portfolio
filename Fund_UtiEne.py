@@ -1,6 +1,9 @@
 # %%
 import requests
 import pandas as pd
+import numpy as np
+import os
+import TechAna_DRAFT as TechAna
 
 uti_ene = ['Utilities', 'Oil & Gas']
 all_stocks = []
@@ -8,6 +11,7 @@ uti_ene_symbols = []
 all_ratios_data = []
 df_ratios = pd.DataFrame()
 uti_ene_ratios_data = {}
+as_of_date = os.getenv("Fund_AsOf_Date")
 
 # Make exports safe even if fetch or scoring fails
 combined_scores_draft = pd.DataFrame()
@@ -22,6 +26,101 @@ try:
         if s.get('industry_lv1') in uti_ene]
     uti_ene_symbols = [s['symbol'] for s in filtered_stocks]
 
+    min_price = 10000
+    price_date = getattr(TechAna, 'END_DATE', None)
+    if price_date and uti_ene_symbols:
+        price_params = {
+            "symbols": ",".join(uti_ene_symbols),
+            "start_date": price_date,
+            "end_date": price_date
+        }
+        r = requests.get(
+            "http://192.168.8.190:8000/MKD/stock_daily",
+            params=price_params,
+            headers={"accept": "application/json"},
+            timeout=30
+        )
+        r.raise_for_status()
+        price_payload = r.json()
+        price_items = []
+        if isinstance(price_payload, dict):
+            for sym, rows in price_payload.items():
+                if isinstance(rows, list):
+                    for row in rows:
+                        if isinstance(row, dict):
+                            row = {**row, "symbol": row.get("symbol", sym)}
+                            price_items.append(row)
+                elif isinstance(rows, dict):
+                    row = {**rows, "symbol": rows.get("symbol", sym)}
+                    price_items.append(row)
+        elif isinstance(price_payload, list):
+            price_items = price_payload
+
+        price_map = {}
+        for row in price_items:
+            if not isinstance(row, dict):
+                continue
+            sym = row.get('symbol')
+            if not sym:
+                continue
+            price = row.get('adj_close')
+            if price is None:
+                price = row.get('close')
+            if price is None:
+                continue
+            try:
+                price_map[sym] = float(price)
+            except (TypeError, ValueError):
+                continue
+
+        if price_map:
+            min_price_symbols = {s for s, v in price_map.items() if v >= min_price}
+            filtered_stocks = [s for s in filtered_stocks if s.get('symbol') in min_price_symbols]
+            uti_ene_symbols = [s['symbol'] for s in filtered_stocks]
+
+    url_daily = "http://192.168.8.190:8000/MKD/stock-ratios-daily"
+    daily_params = {
+        "symbols": ",".join(uti_ene_symbols),
+        "codes": "30022",
+        "start_date": "2025-11-01",
+        "end_date": "2025-12-31"
+    }
+    r = requests.get(url_daily, params=daily_params, headers={"accept": "application/json"})
+    r.raise_for_status()
+    daily_payload = r.json()
+    if isinstance(daily_payload, dict):
+        daily_data = daily_payload.get('data', [])
+    else:
+        daily_data = daily_payload
+
+    matching_volume_sum = {}
+    matching_volume_count = {}
+    for record in daily_data:
+        if not isinstance(record, dict):
+            continue
+        if str(record.get('code')) != '30022':
+            continue
+        symbol = record.get('symbol')
+        value = record.get('value')
+        if symbol and value is not None:
+            matching_volume_sum[symbol] = matching_volume_sum.get(symbol, 0.0) + float(value)
+            matching_volume_count[symbol] = matching_volume_count.get(symbol, 0) + 1
+
+    matching_volume_12_2025 = {
+        symbol: matching_volume_sum[symbol] / matching_volume_count[symbol]
+        for symbol in matching_volume_sum
+        if matching_volume_count.get(symbol, 0) > 0
+    }
+
+    # Sort by average matching volume December 2025 and take top 100
+    filtered_stocks = sorted(
+        uti_ene_symbols,
+        key=lambda s: float(matching_volume_12_2025.get(s, float('-inf'))),
+        reverse=True
+    )
+    top_50_stocks = filtered_stocks[:50]
+    uti_ene_symbols = top_50_stocks
+
     url = "http://192.168.8.190:8000/MKD/stock-ratios"
     params = {
         "symbols": ",".join(uti_ene_symbols),
@@ -33,41 +132,25 @@ try:
     r.raise_for_status()
     all_ratios_data.extend(r.json())
 
-    # Extract ryd11 values for 2025 Q3 directly from ratios data
-    ryd11_2025_q3 = {}
-    for record in all_ratios_data:
-        if (record.get('code') == 'ryd11' and 
-            record.get('year') == 2025 and 
-            record.get('quarter') == 3):
-            symbol = record.get('symbol')
-            value = record.get('value')
-            if symbol and value is not None:
-                ryd11_2025_q3[symbol] = float(value)
-
-    # Sort by ryd11 2025 Q3 and take top 100
-    filtered_stocks = sorted(
-        filtered_stocks,
-        key=lambda s: float(ryd11_2025_q3.get(s.get('symbol'), float('-inf'))),
-        reverse=True
-    )
-    top_50_stocks = filtered_stocks[:50]
-    uti_ene_symbols = [s['symbol'] for s in top_50_stocks]
-
-    # Convert to DataFrame
     df_ratios = pd.DataFrame(all_ratios_data)
 
+    if not as_of_date:
+        try:
+            end_dt = pd.to_datetime(getattr(TechAna, 'END_DATE', None), errors = "coerce")
+            if pd.notna(end_dt):
+                prev_q_end = (end_dt.to_period('Q') - 1).end_time
+                as_of_date = prev_q_end.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
     if 'symbol' in df_ratios.columns:
-        for symbol in uti_ene_symbols:
-            symbol_data = df_ratios[df_ratios['symbol'] == symbol]
-            if not symbol_data.empty:
-                uti_ene_ratios_data[symbol] = symbol_data.copy()
+        df_filtered = df_ratios[df_ratios['symbol'].isin(uti_ene_symbols)]
+        for symbol, symbol_data in df_filtered.groupby('symbol'):
+            uti_ene_ratios_data[symbol] = symbol_data.copy()
 
 except Exception as e:
     # Keep importable even if API is down
     print(f"[Fund_UtiEne] Warning: failed to fetch uti_ene ratios: {e}")
-
-# %%
-print(uti_ene_symbols)
 
 # %%
 class LiquidityScorer:
@@ -145,7 +228,7 @@ class LiquidityScorer:
 
         return series
     
-    def evaluate_criterion(self, uti_ene_df, criterion, all_companies_data):
+    def evaluate_criterion(self, uti_ene_df, criterion, all_companies_data, peer_data_cache=None):
         """Evaluate a single criterion over the last 12 quarters"""
         try:
             crit_type = criterion['type']
@@ -198,29 +281,37 @@ class LiquidityScorer:
                 period_values = {p: v for p, v in series}
 
                 if crit_type == 'calculated_peer':
-                    peer_maps = [
-                        {
-                            p: v for p, v in self.calculate_ratio_series(df, numerator, denominator, periods=None)
-                        }
-                        for df in all_companies_data.values()
-                    ]
+                    cache_key = f"ratio:{numerator}/{denominator}"
+                    if peer_data_cache and cache_key in peer_data_cache:
+                        peer_maps = peer_data_cache[cache_key]
+                    else:
+                        peer_maps = [
+                            {
+                                p: v for p, v in self.calculate_ratio_series(df, numerator, denominator, periods=None)
+                            }
+                            for df in all_companies_data.values()
+                        ]
                 else:
-                    peer_maps = [self.get_metric_period_dict(df, criterion['code']) for df in all_companies_data.values()]
+                    code = criterion['code']
+                    if peer_data_cache and code in peer_data_cache:
+                        peer_maps = peer_data_cache[code]
+                    else:
+                        peer_maps = [self.get_metric_period_dict(df, code) for df in all_companies_data.values()]
 
                 period_passes = []
                 percentiles = []
                 for period_key, value in period_values.items():
-                    peer_values = [pm.get(period_key) for pm in peer_maps if pm.get(period_key) is not None]
-                    if not peer_values:
+                    peer_values = np.array([pm.get(period_key) for pm in peer_maps if pm.get(period_key) is not None])
+                    if len(peer_values) == 0:
                         period_passes.append(False)
                         percentiles.append(None)
                         continue
 
                     if criterion['direction'] == 'lower':
-                        pct = (value <= pd.Series(peer_values)).sum() / len(peer_values)
+                        pct = (value <= peer_values).sum() / len(peer_values)
                         pass_check = pct <= criterion['cut']
                     else:
-                        pct = (value >= pd.Series(peer_values)).sum() / len(peer_values)
+                        pct = (value >= peer_values).sum() / len(peer_values)
                         pass_check = pct >= criterion['cut']
 
                     period_passes.append(pass_check)
@@ -243,7 +334,7 @@ class LiquidityScorer:
         except Exception as e:
             return {'pass': False, 'reason': str(e)}
     
-    def score_uti_ene(self, symbol, uti_ene_df, all_companies_data):
+    def score_uti_ene(self, symbol, uti_ene_df, all_companies_data, peer_data_cache=None):
         """Calculate liquidity score for a uti_ene (0-5 points)"""
         results = {}
         points = 0
@@ -253,7 +344,7 @@ class LiquidityScorer:
         must_have_results = []
         for crit in self.criteria:
             if crit['must_have']:
-                result = self.evaluate_criterion(uti_ene_df, crit, all_companies_data)
+                result = self.evaluate_criterion(uti_ene_df, crit, all_companies_data, peer_data_cache)
                 must_have_results.append(result['pass'])
                 results[f"C{crit['id']}"] = result
         
@@ -263,7 +354,7 @@ class LiquidityScorer:
         # Optional criteria (distribute remaining 3 points)
         optional_criteria = [c for c in self.criteria if not c['must_have']]
         for crit in optional_criteria:
-            result = self.evaluate_criterion(uti_ene_df, crit, all_companies_data)
+            result = self.evaluate_criterion(uti_ene_df, crit, all_companies_data, peer_data_cache)
             results[f"C{crit['id']}"] = result
             if result['pass']:
                 points += 3 / len(optional_criteria)  # Distribute 3 points among optional
@@ -276,14 +367,17 @@ class LiquidityScorer:
 
 # %%
 scorer = LiquidityScorer()
+
+peer_data_cache = {}
+metric_codes = ['ryq1']
+for code in metric_codes:
+    peer_data_cache[code] = [scorer.get_metric_period_dict(df, code) for df in uti_ene_ratios_data.values()]
+
 liq_scores = {}
 
 for idx, (symbol, uti_ene_df) in enumerate(uti_ene_ratios_data.items()):
-    score_result = scorer.score_uti_ene(symbol, uti_ene_df, uti_ene_ratios_data)
+    score_result = scorer.score_uti_ene(symbol, uti_ene_df, uti_ene_ratios_data, peer_data_cache)
     liq_scores[symbol] = score_result
-
-# %%
-print(f"LIQ_Score: {[liq_scores[s]['score'] for s in sorted(liq_scores.keys())]}")
 
 # %%
 class ProfitabilityScorer:
@@ -334,7 +428,7 @@ class ProfitabilityScorer:
         metric_data = metric_data.dropna(subset=['value'])
         return dict(metric_data[['period_key', 'value']].itertuples(index=False, name=None))
     
-    def evaluate_criterion(self, uti_ene_df, criterion, all_companies_data):
+    def evaluate_criterion(self, uti_ene_df, criterion, all_companies_data, peer_data_cache=None, trend_std_cache=None):
         """Evaluate a single criterion over the last 12 quarters (or 8 for trend_vol)"""
         try:
             crit_type = criterion['type']
@@ -369,12 +463,15 @@ class ProfitabilityScorer:
                 values = [v for _, v in series]
                 company_std = pd.Series(values).std()
                 
-                peer_stds = []
-                for df in all_companies_data.values():
-                    peer_series = self.get_metric_series(df, criterion['code'], periods=8)
-                    if len(peer_series) >= 3:
-                        peer_values = [v for _, v in peer_series]
-                        peer_stds.append(pd.Series(peer_values).std())
+                if trend_std_cache and criterion['code'] in trend_std_cache:
+                    peer_stds = trend_std_cache[criterion['code']]
+                else:
+                    peer_stds = []
+                    for df in all_companies_data.values():
+                        peer_series = self.get_metric_series(df, criterion['code'], periods=8)
+                        if len(peer_series) >= 3:
+                            peer_values = [v for _, v in peer_series]
+                            peer_stds.append(pd.Series(peer_values).std())
                 
                 if not peer_stds:
                     return {'pass': False, 'reason': 'No peer std available', 'value': company_std}
@@ -395,22 +492,26 @@ class ProfitabilityScorer:
                     return {'pass': False, 'reason': 'No period values available', 'values': []}
 
                 period_values = {p: v for p, v in series}
-                peer_maps = [self.get_metric_period_dict(df, criterion['code']) for df in all_companies_data.values()]
+                code = criterion['code']
+                if peer_data_cache and code in peer_data_cache:
+                    peer_maps = peer_data_cache[code]
+                else:
+                    peer_maps = [self.get_metric_period_dict(df, code) for df in all_companies_data.values()]
 
                 period_passes = []
                 percentiles = []
                 for period_key, value in period_values.items():
-                    peer_values = [pm.get(period_key) for pm in peer_maps if pm.get(period_key) is not None]
-                    if not peer_values:
+                    peer_values = np.array([pm.get(period_key) for pm in peer_maps if pm.get(period_key) is not None])
+                    if len(peer_values) == 0:
                         period_passes.append(False)
                         percentiles.append(None)
                         continue
 
                     if criterion['direction'] == 'lower':
-                        pct = (value <= pd.Series(peer_values)).sum() / len(peer_values)
+                        pct = (value <= peer_values).sum() / len(peer_values)
                         pass_check = pct <= criterion['cut']
                     else:
-                        pct = (value >= pd.Series(peer_values)).sum() / len(peer_values)
+                        pct = (value >= peer_values).sum() / len(peer_values)
                         pass_check = pct >= criterion['cut']
 
                     period_passes.append(pass_check)
@@ -433,7 +534,7 @@ class ProfitabilityScorer:
         except Exception as e:
             return {'pass': False, 'reason': str(e)}
     
-    def score_uti_ene(self, symbol, uti_ene_df, all_companies_data):
+    def score_uti_ene(self, symbol, uti_ene_df, all_companies_data, peer_data_cache=None, trend_std_cache=None):
         """Calculate profitability score for a utilities/energy (0-5 points)"""
         results = {}
         points = 0
@@ -443,7 +544,7 @@ class ProfitabilityScorer:
         must_have_results = []
         for crit in self.criteria:
             if crit['must_have']:
-                result = self.evaluate_criterion(uti_ene_df, crit, all_companies_data)
+                result = self.evaluate_criterion(uti_ene_df, crit, all_companies_data, peer_data_cache, trend_std_cache)
                 must_have_results.append(result['pass'])
                 results[f"C{crit['id']}"] = result
         
@@ -453,7 +554,7 @@ class ProfitabilityScorer:
         # Optional criteria (distribute remaining 3 points)
         optional_criteria = [c for c in self.criteria if not c['must_have']]
         for crit in optional_criteria:
-            result = self.evaluate_criterion(uti_ene_df, crit, all_companies_data)
+            result = self.evaluate_criterion(uti_ene_df, crit, all_companies_data, peer_data_cache, trend_std_cache)
             results[f"C{crit['id']}"] = result
             if result['pass']:
                 points += 3 / len(optional_criteria)  # Distribute 3 points among optional
@@ -466,14 +567,33 @@ class ProfitabilityScorer:
 
 # %%
 prof_scorer = ProfitabilityScorer()
+
+prof_peer_data_cache = {}
+prof_metric_codes = ['ryq25', 'ryq91']
+for code in prof_metric_codes:
+    prof_peer_data_cache[code] = [prof_scorer.get_metric_period_dict(df, code) for df in uti_ene_ratios_data.values()]
+
+trend_std_cache = {}
+trend_code = 'ryq25'
+peer_stds = []
+for df in uti_ene_ratios_data.values():
+    peer_series = prof_scorer.get_metric_series(df, trend_code, periods=8)
+    if len(peer_series) >= 3:
+        peer_values = [v for _, v in peer_series]
+        peer_stds.append(pd.Series(peer_values).std())
+trend_std_cache[trend_code] = peer_stds
+
 prof_scores = {}
 
 for idx, (symbol, uti_ene_df) in enumerate(uti_ene_ratios_data.items()):
-    score_result = prof_scorer.score_uti_ene(symbol, uti_ene_df, uti_ene_ratios_data)
+    score_result = prof_scorer.score_uti_ene(
+        symbol,
+        uti_ene_df,
+        uti_ene_ratios_data,
+        prof_peer_data_cache,
+        trend_std_cache
+    )
     prof_scores[symbol] = score_result
-
-# %%
-print(f"Prof_Score: {[prof_scores[s]['score'] for s in sorted(prof_scores.keys())]}")
 
 # %%
 class SolvencyScorer:
@@ -585,7 +705,7 @@ class SolvencyScorer:
         
         return series
     
-    def evaluate_criterion(self, uti_ene_df, criterion, all_companies_data):
+    def evaluate_criterion(self, uti_ene_df, criterion, all_companies_data, peer_data_cache=None):
         """Evaluate a single criterion over the last 12 quarters (with pass rate ≥ 50%)"""
         try:
             crit_type = criterion['type']
@@ -638,21 +758,29 @@ class SolvencyScorer:
                 # Check if it's a complex formula (multiple codes)
                 if len(criterion['codes']) > 2:
                     series = self.calculate_complex_formula_series(uti_ene_df, criterion['codes'], criterion['formula'], periods=12)
-                    peer_maps = [
-                        {
-                            p: v for p, v in self.calculate_complex_formula_series(df, criterion['codes'], criterion['formula'], periods=None)
-                        }
-                        for df in all_companies_data.values()
-                    ]
+                    cache_key = f"formula:{criterion['formula']}"
+                    if peer_data_cache and cache_key in peer_data_cache:
+                        peer_maps = peer_data_cache[cache_key]
+                    else:
+                        peer_maps = [
+                            {
+                                p: v for p, v in self.calculate_complex_formula_series(df, criterion['codes'], criterion['formula'], periods=None)
+                            }
+                            for df in all_companies_data.values()
+                        ]
                 else:
                     numerator, denominator = criterion['codes']
                     series = self.calculate_ratio_series(uti_ene_df, numerator, denominator, periods=12)
-                    peer_maps = [
-                        {
-                            p: v for p, v in self.calculate_ratio_series(df, numerator, denominator, periods=None)
-                        }
-                        for df in all_companies_data.values()
-                    ]
+                    cache_key = f"ratio:{numerator}/{denominator}"
+                    if peer_data_cache and cache_key in peer_data_cache:
+                        peer_maps = peer_data_cache[cache_key]
+                    else:
+                        peer_maps = [
+                            {
+                                p: v for p, v in self.calculate_ratio_series(df, numerator, denominator, periods=None)
+                            }
+                            for df in all_companies_data.values()
+                        ]
                 
                 if not series:
                     return {'pass': False, 'reason': 'No period values available', 'values': []}
@@ -662,17 +790,17 @@ class SolvencyScorer:
                 period_passes = []
                 percentiles = []
                 for period_key, value in period_values.items():
-                    peer_values = [pm.get(period_key) for pm in peer_maps if pm.get(period_key) is not None]
-                    if not peer_values:
+                    peer_values = np.array([pm.get(period_key) for pm in peer_maps if pm.get(period_key) is not None])
+                    if len(peer_values) == 0:
                         period_passes.append(False)
                         percentiles.append(None)
                         continue
 
                     if criterion['direction'] == 'lower':
-                        pct = (value <= pd.Series(peer_values)).sum() / len(peer_values)
+                        pct = (value <= peer_values).sum() / len(peer_values)
                         pass_check = pct <= criterion['cut']
                     else:
-                        pct = (value >= pd.Series(peer_values)).sum() / len(peer_values)
+                        pct = (value >= peer_values).sum() / len(peer_values)
                         pass_check = pct >= criterion['cut']
 
                     period_passes.append(pass_check)
@@ -695,7 +823,7 @@ class SolvencyScorer:
         except Exception as e:
             return {'pass': False, 'reason': str(e)}
     
-    def score_uti_ene(self, symbol, uti_ene_df, all_companies_data):
+    def score_uti_ene(self, symbol, uti_ene_df, all_companies_data, peer_data_cache=None):
         """Calculate solvency score for a uti_ene (0-5 points)"""
         results = {}
         points = 0
@@ -705,7 +833,7 @@ class SolvencyScorer:
         must_have_results = []
         for crit in self.criteria:
             if crit['must_have']:
-                result = self.evaluate_criterion(uti_ene_df, crit, all_companies_data)
+                result = self.evaluate_criterion(uti_ene_df, crit, all_companies_data, peer_data_cache)
                 must_have_results.append(result['pass'])
                 results[f"C{crit['id']}"] = result
         
@@ -715,7 +843,7 @@ class SolvencyScorer:
         # Optional criteria (distribute remaining 3 points)
         optional_criteria = [c for c in self.criteria if not c['must_have']]
         for crit in optional_criteria:
-            result = self.evaluate_criterion(uti_ene_df, crit, all_companies_data)
+            result = self.evaluate_criterion(uti_ene_df, crit, all_companies_data, peer_data_cache)
             results[f"C{crit['id']}"] = result
             if result['pass']:
                 points += 3 / len(optional_criteria)  # Distribute 3 points among optional
@@ -728,18 +856,38 @@ class SolvencyScorer:
 
 # %%
 solv_scorer = SolvencyScorer()
+
+solv_peer_data_cache = {}
+for crit in solv_scorer.criteria:
+    if crit.get('type') != 'calculated_peer':
+        continue
+    if len(crit['codes']) > 2:
+        cache_key = f"formula:{crit['formula']}"
+        if cache_key not in solv_peer_data_cache:
+            solv_peer_data_cache[cache_key] = [
+                {
+                    p: v for p, v in solv_scorer.calculate_complex_formula_series(df, crit['codes'], crit['formula'], periods=None)
+                }
+                for df in uti_ene_ratios_data.values()
+            ]
+    else:
+        numerator, denominator = crit['codes']
+        cache_key = f"ratio:{numerator}/{denominator}"
+        if cache_key not in solv_peer_data_cache:
+            solv_peer_data_cache[cache_key] = [
+                {
+                    p: v for p, v in solv_scorer.calculate_ratio_series(df, numerator, denominator, periods=None)
+                }
+                for df in uti_ene_ratios_data.values()
+            ]
+
 solv_scores = {}
 
 for idx, (symbol, uti_ene_df) in enumerate(uti_ene_ratios_data.items()):
-    score_result = solv_scorer.score_uti_ene(symbol, uti_ene_df, uti_ene_ratios_data)
+    score_result = solv_scorer.score_uti_ene(symbol, uti_ene_df, uti_ene_ratios_data, solv_peer_data_cache)
     solv_scores[symbol] = score_result
 
 # %%
-print(f"Solv_Score: {[solv_scores[s]['score'] for s in sorted(solv_scores.keys())]}")
-
-# %%
-import numpy as np
-
 class RelativeValuationScorer:
     def __init__(self):
         self.criteria = [
@@ -859,7 +1007,6 @@ try:
     combined_scores_draft['Rank'] = combined_scores_draft['Total_Score'].rank(method='min', ascending=False).astype(int)
     combined_scores_draft = combined_scores_draft[['Rank','Symbol','LIQ_Score','PROF_Score','SOLV_Score','VAL_Score','Total_Score']].sort_values(['Rank','Symbol']).reset_index(drop=True)
 
-    print(f"UtiEne Comprehensive Scores: \n {combined_scores_draft}")
 except Exception as e:
     print(f"[Fund_UTIENE] ERROR: failed to build combined_scores_draft: {type(e).__name__}: {e}")
     import traceback

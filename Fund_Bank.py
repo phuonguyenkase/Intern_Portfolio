@@ -1,12 +1,15 @@
 # %%
 import requests
 import pandas as pd
+import os
+import TechAna_DRAFT as TechAna
 
 all_stocks = []
 bank_symbols = []
 all_ratios_data = []
 df_ratios = pd.DataFrame()
 bank_ratios_data = {}
+as_of_date = os.getenv("Fund_AsOf_Date")
 
 # Make exports safe even if fetch or scoring fails
 combined_scores_draft = pd.DataFrame()
@@ -45,6 +48,14 @@ try:
             ),
             errors='coerce'
         )
+    if not as_of_date:
+        try:
+            end_dt = pd.to_datetime(getattr(TechAna, 'END_DATE', None), errors = "coerce")
+            if pd.notna(end_dt):
+                prev_q_end = (end_dt.to_period('Q') - 1).end_time
+                as_of_date = prev_q_end.strftime("%Y-%m-%d")
+        except Exception:
+            pass
 
     # Organize by bank
     if 'symbol' in df_ratios.columns:
@@ -619,7 +630,6 @@ try:
     combined_scores_draft['Rank'] = combined_scores_draft['Total_Score'].rank(method='min', ascending=False).astype(int)
     combined_scores_draft = combined_scores_draft[['Rank','Symbol','LIQ_Score','PROF_Score','SOLV_Score','VAL_Score','Total_Score']].sort_values(['Rank','Symbol']).reset_index(drop=True)
 
-    print(f"Bank Comprehensive Scores: \n {combined_scores_draft}")
 except Exception as e:
     print(f"[Fund_BANK] ERROR: failed to build combined_scores_draft: {type(e).__name__}: {e}")
     import traceback

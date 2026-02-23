@@ -1,7 +1,7 @@
 # %%
 import pandas as pd
 import TechAna
-from TechAna import START_DATE, END_DATE
+from TechAna_DRAFT import START_DATE, END_DATE
 
 try:
     from Fund_RealEstate import combined_scores_draft as df_final
@@ -16,16 +16,33 @@ else:
     symbols_to_analyze = []
     print("There's no stock")
 
+
+def _derive_year_quarter(end_date):
+    end_dt = pd.to_datetime(end_date, errors='coerce')
+    if pd.isna(end_dt):
+        return None, None
+    period = end_dt.to_period('Q')
+    return int(period.year), int(period.quarter)
+
 # %%
-if symbols_to_analyze:
-    print(f"Running comprehensive analysis for {len(symbols_to_analyze)} Real Estate symbols...")
+def get_total_score(start_date, end_date, industry='RealEstate', year=None, quarter=None):
+    if year is None or quarter is None:
+        year, quarter = _derive_year_quarter(end_date)
+
+    if not symbols_to_analyze:
+        return pd.DataFrame(columns=[
+            'Rank', 'Symbol', 'Fund_Score', 'Tech_Score',
+            'Foreign_Score', 'Risk_Score', 'Final_Score'
+        ])
+
     tech_scores, foreign_scores, risk_scores = TechAna.analyze_symbols(
-        symbols_to_analyze, 
-        START_DATE, 
-        END_DATE,
-        industry='Real Estate',
-        year=2025,
-        quarter=3)
+        symbols_to_analyze,
+        start_date,
+        end_date,
+        industry=industry,
+        year=year,
+        quarter=quarter
+    )
 
     fund_map = dict(zip(df_final['Symbol'], df_final['Total_Score']))
 
@@ -46,10 +63,10 @@ if symbols_to_analyze:
 
     df_total = pd.DataFrame(final_rows)
     
-    W_FUND = 0.3
+    W_FUND = 0.2
     W_TECH = 0.45
-    W_FOREIGN = 0.1
-    W_RISK = 0.15
+    W_FOREIGN = 0.3
+    W_RISK = 0.1
 
     df_total['Final_Score'] = (
         W_FUND * (df_total['Fund_Score']) +
@@ -74,10 +91,12 @@ if symbols_to_analyze:
         'Final_Score'
     ]]
 
-    print("Summary Score for Real Estate:")
-    
-else:
-    print("Không có dữ liệu để tổng hợp.")
+    return display_df
 
 # %%
-print(display_df.to_string(index=False))
+if __name__ == "__main__":
+    if symbols_to_analyze:
+        display_df = get_total_score(START_DATE, END_DATE, industry='RealEstate')
+        print(display_df.to_string(index=False))
+    else:
+        print("No data validated for analysis.")

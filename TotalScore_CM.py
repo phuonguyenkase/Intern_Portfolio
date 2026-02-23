@@ -1,9 +1,7 @@
 # %%
 import pandas as pd
-import TechAna
-
-START_DATE = "2025-10-01"
-END_DATE = "2025-12-31"
+import TechAna_DRAFT as TechAna
+from TechAna_DRAFT import START_DATE, END_DATE
 
 try:
     from Fund_Industrials_CM import combined_scores_draft as df_final
@@ -18,16 +16,33 @@ else:
     symbols_to_analyze = []
     print("There's no stock")
 
+
+def _derive_year_quarter(end_date):
+    end_dt = pd.to_datetime(end_date, errors='coerce')
+    if pd.isna(end_dt):
+        return None, None
+    period = end_dt.to_period('Q')
+    return int(period.year), int(period.quarter)
+
 # %%
-if symbols_to_analyze:
-    print(f"Running comprehensive analysis for {len(symbols_to_analyze)} Industrials Construction & Materials symbols...")
+def get_total_score(start_date, end_date, industry='Industrials_Construction_Materials', year=None, quarter=None):
+    if year is None or quarter is None:
+        year, quarter = _derive_year_quarter(end_date)
+
+    if not symbols_to_analyze:
+        return pd.DataFrame(columns=[
+            'Rank', 'Symbol', 'Fund_Score', 'Tech_Score',
+            'Foreign_Score', 'Risk_Score', 'Final_Score'
+        ])
+    
     tech_scores, foreign_scores, risk_scores = TechAna.analyze_symbols(
-        symbols_to_analyze, 
-        START_DATE, 
-        END_DATE,
-        industry='Industrials_Construction_Materials',
-        year=2025,
-        quarter=3)
+        symbols_to_analyze,
+        start_date,
+        end_date,
+        industry=industry,
+        year=year,
+        quarter=quarter
+    )
 
     fund_map = dict(zip(df_final['Symbol'], df_final['Total_Score']))
 
@@ -60,15 +75,12 @@ if symbols_to_analyze:
         W_RISK * (df_total['Risk_Score'])
     )
 
-    # Sắp xếp và xếp hạng
     df_total = df_total.sort_values(by='Final_Score', ascending=False).reset_index(drop=True)
     df_total['Rank'] = df_total.index + 1
 
-    # Làm tròn số hiển thị
     cols_to_round = ['Final_Score']
     df_total[cols_to_round] = df_total[cols_to_round].round(2)
 
-    # Đổi tên cột hiển thị cho đẹp
     display_df = df_total[[
         'Rank', 'Symbol', 
         'Fund_Score',
@@ -77,11 +89,12 @@ if symbols_to_analyze:
         'Risk_Score', 
         'Final_Score'
     ]]
-
-    print("Summary Score for Industrials Construction & Materials:")
-    
-else:
-    print("Không có dữ liệu để tổng hợp.")
+    return display_df    
 
 # %%
-print(display_df.to_string(index=False))
+if __name__ == "__main__":
+    if symbols_to_analyze:
+        display_df = get_total_score(START_DATE, END_DATE, industry='Industrials_Construction_Materials')
+        print(display_df.to_string(index=False))
+    else:
+        print("No data validated for analysis.")

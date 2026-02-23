@@ -51,7 +51,6 @@ def get_market_cap_rankings(symbols_list, year=2025, quarter=3, top_n=10):
                     market_caps[symbol] = float(value)
         
         if not market_caps:
-            print(f"[config_bluechip] No data for {year} Q{quarter}, using latest available")
             market_cap_by_symbol = {}
             for record in all_ratios_data:
                 if record.get('code') == 'ryd11':

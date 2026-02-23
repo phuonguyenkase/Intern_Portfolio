@@ -1,6 +1,8 @@
 # %%
 import requests
 import pandas as pd
+import os
+import TechAna_DRAFT as TechAna
 
 all_stocks = []
 healthcare_symbols = []
@@ -8,6 +10,7 @@ all_ratios_data = []
 df_ratios = pd.DataFrame()
 healthcare_ratios_data = {}
 combined_scores_draft = pd.DataFrame()
+as_of_date = os.getenv("Fund_AsOf_Date")
 
 # %%
 try:
@@ -20,6 +23,58 @@ try:
         if s.get('industry_lv1') == 'Health Care'
     ]
     healthcare_symbols = [s['symbol'] for s in filtered_stocks]
+
+    min_price = 10000
+    price_date = getattr(TechAna, 'END_DATE', None)
+    if price_date and healthcare_symbols:
+        price_params = {
+            "symbols": ",".join(healthcare_symbols),
+            "start_date": price_date,
+            "end_date": price_date
+        }
+        r = requests.get(
+            "http://192.168.8.190:8000/MKD/stock_daily",
+            params=price_params,
+            headers={"accept": "application/json"},
+            timeout=30
+        )
+        r.raise_for_status()
+        price_payload = r.json()
+        price_items = []
+        if isinstance(price_payload, dict):
+            for sym, rows in price_payload.items():
+                if isinstance(rows, list):
+                    for row in rows:
+                        if isinstance(row, dict):
+                            row = {**row, "symbol": row.get("symbol", sym)}
+                            price_items.append(row)
+                elif isinstance(rows, dict):
+                    row = {**rows, "symbol": rows.get("symbol", sym)}
+                    price_items.append(row)
+        elif isinstance(price_payload, list):
+            price_items = price_payload
+
+        price_map = {}
+        for row in price_items:
+            if not isinstance(row, dict):
+                continue
+            sym = row.get('symbol')
+            if not sym:
+                continue
+            price = row.get('adj_close')
+            if price is None:
+                price = row.get('close')
+            if price is None:
+                continue
+            try:
+                price_map[sym] = float(price)
+            except (TypeError, ValueError):
+                continue
+
+        if price_map:
+            min_price_symbols = {s for s, v in price_map.items() if v >= min_price}
+            filtered_stocks = [s for s in filtered_stocks if s.get('symbol') in min_price_symbols]
+            healthcare_symbols = [s['symbol'] for s in filtered_stocks]
 
     url = "http://192.168.8.190:8000/MKD/stock-ratios"
     params = {
@@ -48,11 +103,20 @@ try:
         key=lambda s: float(ryd11_2025_q3.get(s.get('symbol'), float('-inf'))),
         reverse=True
     )
-    top_50_stocks = filtered_stocks[:50]
-    healthcare_symbols = [s['symbol'] for s in top_50_stocks]
+    top_40_stocks = filtered_stocks[:40]
+    healthcare_symbols = [s['symbol'] for s in top_40_stocks]
 
     # Convert to DataFrame
     df_ratios = pd.DataFrame(all_ratios_data)
+    
+    if not as_of_date:
+        try:
+            end_dt = pd.to_datetime(getattr(TechAna, 'END_DATE', None), errors = "coerce")
+            if pd.notna(end_dt):
+                prev_q_end = (end_dt.to_period('Q') - 1).end_time
+                as_of_date = prev_q_end.strftime("%Y-%m-%d")
+        except Exception:
+            pass
 
     if 'symbol' in df_ratios.columns:
         for symbol in healthcare_symbols:
@@ -794,7 +858,6 @@ try:
     combined_scores_draft['Rank'] = combined_scores_draft['Total_Score'].rank(method='min', ascending=False).astype(int)
     combined_scores_draft = combined_scores_draft[['Rank','Symbol','LIQ_Score','PROF_Score','SOLV_Score','VAL_Score','Total_Score']].sort_values(['Rank','Symbol']).reset_index(drop=True)
 
-    print(f"Healthcare Comprehensive Scores: \n {combined_scores_draft}")
 except Exception as e:
     print(f"[Fund_HEALTHCARE] ERROR: failed to build combined_scores_draft: {type(e).__name__}: {e}")
     import traceback

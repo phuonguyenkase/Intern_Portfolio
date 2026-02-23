@@ -1,12 +1,15 @@
 # %%
 import requests
 import pandas as pd
+import os
+import TechAna_DRAFT as TechAna
 
 all_stocks = []
 RealEstate_symbols = []
 all_ratios_data = []
 df_ratios = pd.DataFrame()
 RealEstate_ratios_data = {}
+as_of_date = os.getenv("Fund_AsOf_Date")
 
 # Make exports safe even if fetch or scoring fails
 combined_scores_draft = pd.DataFrame()
@@ -26,6 +29,63 @@ try:
     ]
     if not RealEstate_symbols:
         RealEstate_symbols = [s for s in all_stocks if isinstance(s, str)]
+
+    min_price = 10000
+    price_date = getattr(TechAna, 'END_DATE', None)
+    if price_date and RealEstate_symbols:
+        price_params = {
+            "symbols": ",".join(RealEstate_symbols),
+            "start_date": price_date,
+            "end_date": price_date
+        }
+        r = requests.get(
+            "http://192.168.8.190:8000/MKD/stock_daily",
+            params=price_params,
+            headers={"accept": "application/json"},
+            timeout=30
+        )
+        r.raise_for_status()
+        price_payload = r.json()
+        price_items = []
+        if isinstance(price_payload, dict):
+            for sym, rows in price_payload.items():
+                if isinstance(rows, list):
+                    for row in rows:
+                        if isinstance(row, dict):
+                            row = {**row, "symbol": row.get("symbol", sym)}
+                            price_items.append(row)
+                elif isinstance(rows, dict):
+                    row = {**rows, "symbol": rows.get("symbol", sym)}
+                    price_items.append(row)
+        elif isinstance(price_payload, list):
+            price_items = price_payload
+
+        price_map = {}
+        for row in price_items:
+            if not isinstance(row, dict):
+                continue
+            sym = row.get('symbol')
+            if not sym:
+                continue
+            price = row.get('adj_close')
+            if price is None:
+                price = row.get('close')
+            if price is None:
+                continue
+            try:
+                price_map[sym] = float(price)
+            except (TypeError, ValueError):
+                continue
+
+        if price_map:
+            min_price_symbols = {s for s, v in price_map.items() if v >= min_price}
+            RealEstate_symbols = [s for s in RealEstate_symbols if s in min_price_symbols]
+        else:
+            # If price_map is empty, no stocks passed price filter
+            RealEstate_symbols = []
+    else:
+        # If price_date is missing or no symbols, clear the list
+        RealEstate_symbols = []
     
     url = "http://192.168.8.190:8000/MKD/stock-ratios"
     params = {
@@ -73,7 +133,7 @@ try:
         if matching_volume_count.get(symbol, 0) > 0
     }
 
-    # Sort by average matching volume December 2025 and take top 100
+    # Sort by average matching volume December 2025 and take top 50
     filtered_stocks = sorted(
         RealEstate_symbols,
         key=lambda s: float(matching_volume_12_2025.get(s, float('-inf'))),
@@ -84,6 +144,15 @@ try:
 
     df_ratios = pd.DataFrame(all_ratios_data)
 
+    if not as_of_date:
+        try:
+            end_dt = pd.to_datetime(getattr(TechAna, 'END_DATE', None), errors = "coerce")
+            if pd.notna(end_dt):
+                prev_q_end = (end_dt.to_period('Q') - 1).end_time
+                as_of_date = prev_q_end.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
     if 'symbol' in df_ratios.columns:
         for symbol in RealEstate_symbols:
             symbol_data = df_ratios[df_ratios['symbol'] == symbol]
@@ -93,9 +162,6 @@ try:
 except Exception as e:
     # Keep importable even if API is down
     print(f"[Fund_RealEstate] Warning: failed to fetch real estate ratios: {e}")
-
-# %%
-print(RealEstate_symbols)
 
 # %%
 import numpy as np
@@ -306,10 +372,6 @@ liq_scores = {}
 for idx, (symbol, realestate_df) in enumerate(RealEstate_ratios_data.items()):
     score_result = scorer.score_realestate(symbol, realestate_df, RealEstate_ratios_data, peer_data_cache)
     liq_scores[symbol] = score_result
-
-# %%
-'''for symbol in sorted(liq_scores.keys()):
-    print(f"{symbol}: {liq_scores[symbol].get('score')}")'''
 
 # %%
 class ProfitabilityScorer:
@@ -692,10 +754,6 @@ for idx, (symbol, realestate_df) in enumerate(RealEstate_ratios_data.items()):
     solv_scores[symbol] = score_result
 
 # %%
-for symbol in sorted(solv_scores.keys()):
-    print(f"{symbol}: {solv_scores[symbol].get('score')}")
-
-# %%
 class RelativeValuationScorer:
     def __init__(self):
         self.criteria = [
@@ -851,7 +909,6 @@ try:
     combined_scores_draft['Rank'] = combined_scores_draft['Total_Score'].rank(method='min', ascending=False).astype(int)
     combined_scores_draft = combined_scores_draft[['Rank','Symbol','LIQ_Score','PROF_Score','SOLV_Score','VAL_Score','Total_Score']].sort_values(['Rank','Symbol']).reset_index(drop=True)
 
-    print(f"Real Estate Comprehensive Scores: \n {combined_scores_draft}")
 except Exception as e:
     print(f"[Fund_REAL_ESTATE] ERROR: failed to build combined_scores_draft: {type(e).__name__}: {e}")
     import traceback

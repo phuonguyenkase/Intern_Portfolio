@@ -1,10 +1,8 @@
 # %%
 import pandas as pd
-import TechAna
+import TechAna_DRAFT as TechAna
 import RiskControl_Fin as RiskControl
-
-START_DATE = "2025-09-01"
-END_DATE = "2025-12-31"
+from TechAna_DRAFT import START_DATE, END_DATE
 
 try:
     from Fund_Financials import combined_scores_draft as df_final
@@ -19,22 +17,38 @@ else:
     symbols_to_analyze = []
     print("There's no stock")
 
+
+def _derive_year_quarter(end_date):
+    end_dt = pd.to_datetime(end_date, errors='coerce')
+    if pd.isna(end_dt):
+        return None, None
+    period = end_dt.to_period('Q')
+    return int(period.year), int(period.quarter)
+
 # %%
-if symbols_to_analyze:
-    print(f"Running comprehensive analysis for {len(symbols_to_analyze)} Financials symbols...")
-    tech_scores, foreign_scores, _ = TechAna.analyze_symbols(
-        symbols_to_analyze, 
-        START_DATE, 
-        END_DATE,
-        industry='Financials',
-        year=2025,
-        quarter=3)
+def get_total_score(start_date, end_date, industry='Financials', year=None, quarter=None):
+    if year is None or quarter is None:
+        year, quarter = _derive_year_quarter(end_date)
+
+    if not symbols_to_analyze:
+        return pd.DataFrame(columns=[
+            'Rank', 'Symbol', 'Fund_Score', 'Tech_Score',
+            'Foreign_Score', 'Risk_Score', 'Final_Score'
+        ])
+
+    tech_scores, foreign_scores, risk_scores = TechAna.analyze_symbols(
+        symbols_to_analyze,
+        start_date,
+        end_date,
+        industry=industry,
+        year=year,
+        quarter=quarter
+    )
 
     fund_map = dict(zip(df_final['Symbol'], df_final['Total_Score']))
     
     # Use risk_scores from RiskControl_Fin
-    from TechAna import APIFetcher
-    stock_data = APIFetcher.fetch_batch(
+    stock_data = TechAna.APIFetcher.fetch_batch(
         "http://192.168.8.190:8000/MKD/stock_daily", 
         symbols_to_analyze, START_DATE, END_DATE
     )
@@ -90,11 +104,12 @@ if symbols_to_analyze:
         'Risk_Score', 
         'Final_Score'
     ]]
-
-    print("Summary Score for Financials:")
-    
-else:
-    print("Không có dữ liệu để tổng hợp.")
+    return display_df
 
 # %%
-print(display_df[:35].to_string(index=False))
+if __name__ == "__main__":
+    if symbols_to_analyze:
+        display_df = get_total_score(START_DATE, END_DATE, industry='Financials')
+        print(display_df.to_string(index=False))
+    else:
+        print("No data validated for analysis.")

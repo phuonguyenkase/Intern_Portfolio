@@ -6,23 +6,18 @@ import requests
 # %%
 class RiskControlScorer:
     def __init__(self):
-        # Hard thresholds (in VND)
-        self.adv_20_min = 10e9  # 10 billion VND
-        self.market_cap_min = 1000e9  # 1000 billion VND
+        self.adv_20_min = 10e9
+        self.market_cap_min = 1000e9
 
-        # Risk thresholds (relaxed for financial sector volatility)
         self.beta_3m_pct_threshold = 0.80
         self.dd_3m_pct_threshold = 0.80
         self.vol_3m_pct_threshold = 0.80
         
-        # abs(beta_1m - beta_3m) <= 1.0
         self.beta_1m_3m_diff_max = 1.0
         
-        # Turnover and spread thresholds
         self.turnover_pct_threshold = 0.30
         self.bid_ask_spread_pct_threshold = 0.70
         
-        # Red flag thresholds (relaxed for financial sector)
         self.red_flag_vol_threshold = 0.80
         self.red_flag_adv_threshold = 25e12
         
@@ -102,13 +97,11 @@ class RiskControlScorer:
             'red_flags': []
         }
         
-        # Check hard requirements (A1, A2) - MUST_HAVE
         hard_ok, hard_msg = self.check_hard_requirements(rec)
         if not hard_ok:
             result['hard_reject'] = True
             return result
         
-        # Check other criteria - CHECKLIST APPROACH
         checks = [
             ('Market Cap', self.check_market_cap),
             ('Turnover', self.check_turnover_ratio),

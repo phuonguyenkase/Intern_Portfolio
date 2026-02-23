@@ -2,12 +2,15 @@
 import requests
 import pandas as pd
 import numpy as np
+import os
+import TechAna_DRAFT as TechAna
 
 all_stocks = []
 construction_and_materials_symbols = []
 all_ratios_data = []
 df_ratios = pd.DataFrame()
 construction_and_materials_ratios_data = {}
+as_of_date = os.getenv("Fund_AsOf_Date")
 
 # Make exports safe even if fetch or scoring fails
 combined_scores_draft = pd.DataFrame()
@@ -27,6 +30,59 @@ try:
     ]
     if not construction_and_materials_symbols:
         construction_and_materials_symbols = [s for s in all_stocks if isinstance(s, str)]
+
+    min_price = 10000
+    price_date = getattr(TechAna, 'END_DATE', None)
+    if price_date and construction_and_materials_symbols:
+        price_params = {
+            "symbols": ",".join(construction_and_materials_symbols),
+            "start_date": price_date,
+            "end_date": price_date
+        }
+        r = requests.get(
+            "http://192.168.8.190:8000/MKD/stock_daily",
+            params=price_params,
+            headers={"accept": "application/json"},
+            timeout=30
+        )
+        r.raise_for_status()
+        price_payload = r.json()
+        price_items = []
+        if isinstance(price_payload, dict):
+            for sym, rows in price_payload.items():
+                if isinstance(rows, list):
+                    for row in rows:
+                        if isinstance(row, dict):
+                            row = {**row, "symbol": row.get("symbol", sym)}
+                            price_items.append(row)
+                elif isinstance(rows, dict):
+                    row = {**rows, "symbol": rows.get("symbol", sym)}
+                    price_items.append(row)
+        elif isinstance(price_payload, list):
+            price_items = price_payload
+
+        price_map = {}
+        for row in price_items:
+            if not isinstance(row, dict):
+                continue
+            sym = row.get('symbol')
+            if not sym:
+                continue
+            price = row.get('adj_close')
+            if price is None:
+                price = row.get('close')
+            if price is None:
+                continue
+            try:
+                price_map[sym] = float(price)
+            except (TypeError, ValueError):
+                continue
+
+        if price_map:
+            min_price_symbols = {s for s, v in price_map.items() if v >= min_price}
+            construction_and_materials_symbols = [
+                s for s in construction_and_materials_symbols if s in min_price_symbols
+            ]
     
     url = "http://192.168.8.190:8000/MKD/stock-ratios"
     params = {
@@ -49,6 +105,7 @@ try:
     }
     r = requests.get(url_daily, params=daily_params, headers={"accept": "application/json"})
     r.raise_for_status()
+    
     daily_payload = r.json()
     if isinstance(daily_payload, dict):
         daily_data = daily_payload.get('data', [])
@@ -80,24 +137,28 @@ try:
         key=lambda s: float(matching_volume_12_2025.get(s, float('-inf'))),
         reverse=True
     )
-    top_75_stocks = filtered_stocks[:75]
-    construction_and_materials_symbols = top_75_stocks
+    top_50_stocks = filtered_stocks[:50]
+    construction_and_materials_symbols = top_50_stocks
 
     df_ratios = pd.DataFrame(all_ratios_data)
 
+    if not as_of_date:
+        try:
+            end_dt = pd.to_datetime(getattr(TechAna, 'END_DATE', None), errors = "coerce")
+            if pd.notna(end_dt):
+                prev_q_end = (end_dt.to_period('Q') - 1).end_time
+                as_of_date = prev_q_end.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    
     if 'symbol' in df_ratios.columns:
         for symbol in construction_and_materials_symbols:
             symbol_data = df_ratios[df_ratios['symbol'] == symbol]
             if not symbol_data.empty:
                 construction_and_materials_ratios_data[symbol] = symbol_data.copy()
 
-    # Convert to DataFrame
-
 except Exception as e:
     print(f"[Fund_INDUSTRIALS_C&M] Warning: failed to fetch construction and materials ratios: {e}")
-
-# %%
-print(construction_and_materials_symbols)
 
 # %%
 class LiquidityScorer:
@@ -341,10 +402,6 @@ for idx, (symbol, construction_and_materials_df) in enumerate(construction_and_m
     liq_scores[symbol] = score_result
 
 # %%
-for symbol in sorted(liq_scores.keys()):
-    print(f"{symbol}: {liq_scores[symbol].get('score')}")
-
-# %%
 class ProfitabilityScorer:
     def __init__(self):
         self.criteria = [
@@ -502,10 +559,6 @@ prof_scores = {}
 for idx, (symbol, construction_and_materials_df) in enumerate(construction_and_materials_ratios_data.items()):
     score_result = prof_scorer.score_construction_and_materials(symbol, construction_and_materials_df, construction_and_materials_ratios_data, prof_peer_data_cache)
     prof_scores[symbol] = score_result
-
-#%%
-for symbol in sorted(prof_scores.keys()):
-    print(f"{symbol}: {prof_scores[symbol].get('score')}")
 
 # %%
 class SolvencyScorer:
@@ -767,10 +820,6 @@ for idx, (symbol, construction_and_materials_df) in enumerate(construction_and_m
     solv_scores[symbol] = score_result
 
 # %%
-for symbol in sorted(solv_scores.keys()):
-    print(f"{symbol}: {solv_scores[symbol].get('score')}")
-
-# %%
 class RelativeValuationScorer:
     def __init__(self):
         self.criteria = [
@@ -939,12 +988,8 @@ try:
     combined_scores_draft['Rank'] = combined_scores_draft['Total_Score'].rank(method='min', ascending=False).astype(int)
     combined_scores_draft = combined_scores_draft[['Rank','Symbol','LIQ_Score','PROF_Score','SOLV_Score','VAL_Score','Total_Score']].sort_values(['Rank','Symbol']).reset_index(drop=True)
 
-    print(f"Construction and Materials Comprehensive Scores: \n {combined_scores_draft}")
 except Exception as e:
     print(f"[Fund_CONSTRUCTION_AND_MATERIALS] ERROR: failed to build combined_scores_draft: {type(e).__name__}: {e}")
     import traceback
     traceback.print_exc()
     combined_scores_draft = pd.DataFrame()
-
-# %%
-print(combined_scores_draft[:50])

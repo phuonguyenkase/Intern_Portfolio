@@ -1,12 +1,15 @@
 # %%
 import requests
 import pandas as pd
+import os
+import TechAna_DRAFT as TechAna
 
 all_stocks = []
 insurance_symbols = []
 all_ratios_data = []
 df_ratios = pd.DataFrame()
 insurance_ratios_data = {}
+as_of_date = os.getenv("Fund_AsOf_Date")
 
 # Make exports safe even if fetch or scoring fails
 combined_scores_draft = pd.DataFrame()
@@ -44,6 +47,15 @@ try:
             ),
             errors='coerce'
         )
+    
+    if not as_of_date:
+        try:
+            end_dt = pd.to_datetime(getattr(TechAna, 'END_DATE', None), errors = "coerce")
+            if pd.notna(end_dt):
+                prev_q_end = (end_dt.to_period('Q') - 1).end_time
+                as_of_date = prev_q_end.strftime("%Y-%m-%d")
+        except Exception:
+            pass
 
     # Organize by insurance
     if 'symbol' in df_ratios.columns:
@@ -53,9 +65,6 @@ try:
 except Exception as e:
     # Keep importable even if API is down
     print(f"[Fund_INS] Warning: failed to fetch insurance ratios: {e}")
-
-#%%
-print(insurance_ratios_data.keys())
 
 # %%
 class LiquidityScorer:
@@ -463,18 +472,12 @@ for idx, (symbol, insurance_df) in enumerate(insurance_ratios_data.items()):
     liq_scores[symbol] = score_result
 
 # %%
-print(f"LIQ_Score: {[liq_scores[s]['score'] for s in sorted(liq_scores.keys())]}")
-
-# %%
 prof_scorer = ProfitabilityScorer()
 prof_scores = {}
 
 for idx, (symbol, insurance_df) in enumerate(insurance_ratios_data.items()):
     score_result = prof_scorer.score_insurance(symbol, insurance_df, insurance_ratios_data)
     prof_scores[symbol] = score_result
-
-# %%
-print(f"PROF_Score: {[prof_scores[s]['score'] for s in sorted(prof_scores.keys())]}")
 
 # %%
 class SolvencyScorer:
@@ -699,9 +702,6 @@ solv_scores = {}
 for idx, (symbol, insurance_df) in enumerate(insurance_ratios_data.items()):
     score_result = solv_scorer.score_insurance(symbol, insurance_df, insurance_ratios_data)
     solv_scores[symbol] = score_result
-
-# %%
-print(f"SOLV_Score: {[solv_scores[s]['score'] for s in sorted(solv_scores.keys())]}")
 
 # %%
 import numpy as np
@@ -1039,7 +1039,6 @@ try:
     combined_scores_draft['Rank'] = combined_scores_draft['Total_Score'].rank(method='min', ascending=False).astype(int)
     combined_scores_draft = combined_scores_draft[['Rank','Symbol','LIQ_Score','PROF_Score','SOLV_Score','VAL_Score','Total_Score']].sort_values(['Rank','Symbol']).reset_index(drop=True)
 
-    print(f"Insurance Comprehensive Scores: \n {combined_scores_draft}")
 except Exception as e:
     print(f"[Fund_INSURANCE] ERROR: failed to build combined_scores_draft: {type(e).__name__}: {e}")
     import traceback

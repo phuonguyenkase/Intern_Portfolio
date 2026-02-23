@@ -1,9 +1,7 @@
 # %%
 import pandas as pd
-import TechAna
-
-START_DATE = "2025-09-01"
-END_DATE = "2025-12-31"
+import TechAna_DRAFT as TechAna
+from TechAna_DRAFT import START_DATE, END_DATE
 
 try:
     from Fund_TechTele import combined_scores_draft as df_final
@@ -18,16 +16,33 @@ else:
     symbols_to_analyze = []
     print("There's no stock")
 
+
+def _derive_year_quarter(end_date):
+    end_dt = pd.to_datetime(end_date, errors='coerce')
+    if pd.isna(end_dt):
+        return None, None
+    period = end_dt.to_period('Q')
+    return int(period.year), int(period.quarter)
+
 # %%
-if symbols_to_analyze:
-    print(f"Running comprehensive analysis for {len(symbols_to_analyze)} Technology and Telecommunications symbols...")
+def get_total_score(start_date, end_date, industry='TechTele', year=None, quarter=None):
+    if year is None or quarter is None:
+        year, quarter = _derive_year_quarter(end_date)
+
+    if not symbols_to_analyze:
+        return pd.DataFrame(columns=[
+            'Rank', 'Symbol', 'Fund_Score', 'Tech_Score',
+            'Foreign_Score', 'Risk_Score', 'Final_Score'
+        ])
+
     tech_scores, foreign_scores, risk_scores = TechAna.analyze_symbols(
-        symbols_to_analyze, 
-        START_DATE, 
-        END_DATE,
-        industry='Technology',
-        year=2025,
-        quarter=3)
+        symbols_to_analyze,
+        start_date,
+        end_date,
+        industry=industry,
+        year=year,
+        quarter=quarter
+    )
 
     fund_map = dict(zip(df_final['Symbol'], df_final['Total_Score']))
 
@@ -78,10 +93,12 @@ if symbols_to_analyze:
         'Final_Score'
     ]]
 
-    print("Summary Score for Technology and Telecommunications:")
-    
-else:
-    print("Không có dữ liệu để tổng hợp.")
+    return display_df
 
 # %%
-print(display_df.to_string(index=False))
+if __name__ == "__main__":
+    if symbols_to_analyze:
+        display_df = get_total_score(START_DATE, END_DATE, industry='TechTele')
+        print(display_df.to_string(index=False))
+    else:
+        print("No data validated for analysis.")

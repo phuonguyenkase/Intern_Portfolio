@@ -632,9 +632,7 @@ def calculate_risk_metrics_batch(symbol_list, stock_data):
     return records
 
 # %%
-def analyze_symbols(symbol_list, start_date, end_date, industry='Real Estate', year=2025, quarter=3):
-    print(f"Starting Technical & Risk Analysis for {len(symbol_list)} symbols...")
-    
+def analyze_symbols(symbol_list, start_date, end_date, industry='Real Estate', year=2025, quarter=3):    
     bluechip_data = get_cached_bluechips(industry, symbol_list, year, quarter)
     mega_caps = bluechip_data.get('mega_caps', [])
     large_caps = bluechip_data.get('large_caps', [])
@@ -659,7 +657,6 @@ def analyze_symbols(symbol_list, start_date, end_date, industry='Real Estate', y
         vni_series = vni_df[col]
 
     # 3. Technical Scoring
-    print("Calculating Technical Scores...")
     tech_scorer = TechnicalAnalysisScorer()
     tech_scores = {}
     for sym in symbol_list:
@@ -670,7 +667,6 @@ def analyze_symbols(symbol_list, start_date, end_date, industry='Real Estate', y
                 tech_scores[sym] = tech_scorer.score_symbol(sym, df_tech, vni_series)
 
     # 4. Foreign Scoring
-    print("Calculating Foreign Scores...")
     fi_data = calculate_foreign_investor_metrics(symbol_list, start_date, end_date)
     fi_scorer = ForeignInvestorScorer(mega_caps=mega_caps, large_caps=large_caps)
     foreign_scores = {}
@@ -678,7 +674,6 @@ def analyze_symbols(symbol_list, start_date, end_date, industry='Real Estate', y
         foreign_scores[sym] = fi_scorer.score_symbol(sym, data)
 
     # 5. Risk Scoring
-    print("Calculating Risk Scores...")
     risk_scorer = RiskControlScorer()
     risk_records = calculate_risk_metrics_batch(symbol_list, stock_data)
     risk_map = {r['symbol']: r for r in risk_records}

@@ -2,11 +2,13 @@
 import requests
 import pandas as pd
 import numpy as np
+from scipy.stats import linregress
+from Bluechip import get_cached_bluechips
 
-START_DATE = "2025-09-01"
-END_DATE = "2025-12-31"
+START_DATE = "2022-01-01"
+END_DATE = "2022-03-31"
 
-class APIFetcher:    
+class APIFetcher:
     @staticmethod
     def fetch_batch(url, symbol_list, start_date, end_date, timeout_secs=60):
         all_data = {}
@@ -39,7 +41,6 @@ class APIFetcher:
         for symbol, data in all_data.items():
             try:
                 df = pd.DataFrame(data) if isinstance(data, list) else data
-                # Chuẩn hóa cột ngày tháng
                 for date_col in ['date', 'Date', 'trading_date', 'TradingDate']:
                     if date_col in df.columns:
                         df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
@@ -97,126 +98,268 @@ def calculate_technical_indicators_fallback(df):
     return x
 
 #%%
-class TechnicalAnalysisScorer:
-    def __init__(self):
-        self.criteria = [
-            {'id': 1, 'name': 'MA order uptrend', 'type': 'ma_order', 'must_have': True},
-            {'id': 2, 'name': 'MACD positive', 'type': 'macd_status', 'must_have': True},
-            {'id': 3, 'name': 'RSI strength', 'type': 'rsi_status', 'must_have': False},
-            {'id': 4, 'name': 'Price above MA20', 'type': 'price_vs_ma20', 'must_have': False},
-            {'id': 5, 'name': 'Price stability', 'type': 'price_in_bands', 'must_have': False},
-            {'id': 6, 'name': 'Relative strength', 'type': 'relative_strength', 'must_have': False},
-        ]
+def calculate_trend_strength(df, symbol=None):
+    if df is None or len(df) < 60:
+        return {'trend_strength': 0, 'perf_3m': 0, 'ma_alignment': 0}
     
-    def evaluate_criterion(self, tech_df, criterion, vni_series=None):
-        try:
-            latest = tech_df.iloc[-1]
-            crit_type = criterion['type']
-            
-            if crit_type == 'ma_order':
-                return {'pass': latest.get('ma20') > latest.get('ma50') > latest.get('ma200')}
-            elif crit_type == 'macd_status':
-                return {'pass': latest.get('macd12269') > latest.get('macds12269') and latest.get('macd12269') > 0}
-            elif crit_type == 'rsi_status':
-                return {'pass': latest.get('rsi14') > 50}
-            elif crit_type == 'price_vs_ma20':
-                return {'pass': (tech_df['close'].tail(20) > tech_df['ma20'].tail(20)).sum() >= 15}
-            elif crit_type == 'price_in_bands':
-                return {'pass': latest.get('bbl2020') < latest.get('close') < latest.get('bbu2020')}
-            elif crit_type == 'relative_strength':
-                if vni_series is None: return {'pass': False}
-                common = tech_df.index.intersection(vni_series.index)
-                if len(common) < 10: return {'pass': False}
-                s_valid = tech_df.loc[common, 'close']
-                v_valid = vni_series.loc[common]
-                rs = np.log(s_valid) - np.log(v_valid)
-                return {'pass': rs.iloc[-1] > rs.iloc[0]}
-            return {'pass': False}
-        except: return {'pass': False}
+    close = df['close']
+    
+    ma20 = df['ma20'].iloc[-1] if 'ma20' in df.columns else 0
+    ma50 = df['ma50'].iloc[-1] if 'ma50' in df.columns else 0
+    ma200 = df['ma200'].iloc[-1] if 'ma200' in df.columns else ma50
+    price = close.iloc[-1]
+    
+    ma_score = 0
+    if ma20 > 0 and price > ma20: 
+        ma_score += 1
+    if ma50 > 0 and price > ma50: 
+        ma_score += 1
+    if ma200 > 0 and price > ma200: 
+        ma_score += 1
+    if ma20 > 0 and ma50 > 0 and ma20 > ma50: 
+        ma_score += 1
+    if ma50 > 0 and ma200 > 0 and ma50 > ma200: 
+        ma_score += 1
+    ma_score = ma_score / 5.0
+    
+    slope_3m = 0
+    if len(df) >= 60 and 'ma50' in df.columns:
+        ma50_60d_ago = df['ma50'].iloc[-60]
+        if ma50_60d_ago > 0:
+            slope_3m = (ma50 - ma50_60d_ago) / ma50_60d_ago
+        slope_score = min(max(slope_3m * 2, -1), 1)
+    else:
+        slope_score = 0
+    
+    perf_3m = 0
+    price_60d_ago = close.iloc[-60] if len(close) >= 60 else close.iloc[0]
+    if price_60d_ago > 0:
+        perf_3m = (price - price_60d_ago) / price_60d_ago
+    perf_score = min(max(perf_3m * 2, -1), 1)
+    
+    trend_strength = (ma_score * 0.4 + 
+                     (slope_score + 1) / 2 * 0.3 +
+                     (perf_score + 1) / 2 * 0.3)
+    trend_strength = trend_strength * 2 - 1
+    
+    return {
+        'trend_strength': trend_strength,
+        'ma_alignment': ma_score,
+        'slope_3m': slope_3m,
+        'perf_3m': perf_3m
+    }
+
+
+class TechnicalAnalysisScorer:
+    def __init__(self, linreg_window=57):
+        self.linreg_window = linreg_window
+
+    def _compute_linreg_metrics(self, tech_df):
+        if tech_df is None or len(tech_df) < self.linreg_window:
+            return None
+
+        close = pd.to_numeric(tech_df['close'], errors='coerce').dropna()
+        close_60 = close.tail(self.linreg_window)
+        if len(close_60) < self.linreg_window:
+            return None
+
+        x = np.arange(self.linreg_window, dtype=float)
+        y = close_60.values.astype(float)
+
+        lr = linregress(x, y)
+        slope = lr.slope
+        intercept = lr.intercept
+        r_squared = lr.rvalue ** 2 if lr.rvalue is not None else np.nan
+
+        y_pred = slope * x + intercept
+        residuals = y - y_pred
+        std_dev = np.std(residuals, ddof=1)
+        if std_dev == 0 or np.isnan(std_dev):
+            z_score = 0
+        else:
+            z_score = (y[-1] - y_pred[-1]) / std_dev
+
+        # Slope normalization (% per day) and t-stat
+        mean_price = np.nanmean(y) if len(y) > 0 else np.nan
+        if mean_price and not np.isnan(mean_price) and mean_price != 0:
+            slope_pct = slope / mean_price
+        else:
+            slope_pct = np.nan
+
+        stderr = lr.stderr if hasattr(lr, 'stderr') else np.nan
+        if stderr and not np.isnan(stderr) and stderr != 0:
+            t_stat = slope / stderr
+        else:
+            t_stat = np.nan
+
+        vol_corr = np.nan
+        if 'volume' in tech_df.columns:
+            vol = pd.to_numeric(tech_df['volume'], errors='coerce').dropna()
+            vol_60 = vol.tail(self.linreg_window)
+            if len(vol_60) == self.linreg_window:
+                vol_corr = close_60.corr(vol_60)
+
+        return {
+            'slope': slope,
+            'r_squared': r_squared,
+            'z_score': z_score,
+            'vol_corr': vol_corr,
+            'intercept': intercept,
+            'slope_pct': slope_pct,
+            't_stat': t_stat
+        }
 
     def score_symbol(self, symbol, tech_df, vni_series=None):
-        points = 0
-        results = {}
-        must_haves = [c for c in self.criteria if c['must_have']]
-        passed_must = []
-        for c in must_haves:
-            res = self.evaluate_criterion(tech_df, c, vni_series)
-            passed_must.append(res['pass'])
-            results[f"C{c['id']}"] = res
-        
-        if all(passed_must): points += 2
-        
-        optionals = [c for c in self.criteria if not c['must_have']]
-        for c in optionals:
-            res = self.evaluate_criterion(tech_df, c, vni_series)
-            results[f"C{c['id']}"] = res
-            if res['pass']: points += 3/len(optionals)
-        return {'symbol': symbol, 'score': min(points, 5), 'details': results}
+        if tech_df is None or len(tech_df) < self.linreg_window:
+            return {'symbol': symbol, 'score': 0, 'trend_strength': 0}
 
-# %%
-class ForeignInvestorScorer:
-    def __init__(self):
-        self.criteria = [
-            {'id': 1, 'name': 'NFF supportive (5D)', 'code': 'pct_nff_5d', 'direction': 'higher_better', 'must_have': True, 'threshold': 0.70},
-            {'id': 2, 'name': 'FFR buy bias (5D)', 'code': 'pct_ffr_5d', 'direction': 'higher_better', 'must_have': True, 'threshold': 0.70},
-            {'id': 3, 'name': 'Room decreasing (5D)', 'code': 'pct_room_delta_5d', 'direction': 'lower_better', 'must_have': False, 'threshold': 0.30},
-            {'id': 4, 'name': 'NFF strong (1D)', 'code': 'pct_nff_1d', 'direction': 'higher_better', 'must_have': False, 'threshold': 0.70},
-            {'id': 5, 'name': 'FFR buy bias (1D)', 'code': 'pct_ffr_1d', 'direction': 'higher_better', 'must_have': False, 'threshold': 0.70},
-            {'id': 6, 'name': 'Room decreasing (1D)', 'code': 'pct_room_delta_1d', 'direction': 'lower_better', 'must_have': False, 'threshold': 0.30},
-        ]
-        
-    def score_symbol(self, symbol, fi_dict):
-        if not fi_dict: return {'symbol': symbol, 'score': 0}
-        points = 0
-        must_pass = True
-        
-        for c in self.criteria:
-            val = fi_dict.get(c['code']) # Lấy giá trị Percentile đã tính
-            passed = False
-            if val is not None:
-                passed = val >= c['threshold'] if c['direction'] == 'higher_better' else val <= c['threshold']
-            
-            if c['must_have'] and not passed: must_pass = False
-            if not c['must_have'] and passed: points += 3/4
-            
-        if must_pass: points += 2
-        return {'symbol': symbol, 'score': min(points, 5)}
+        metrics = self._compute_linreg_metrics(tech_df)
+        if metrics is None:
+            return {'symbol': symbol, 'score': 0, 'trend_strength': 0}
 
-# %%
-class RiskControlScorer:
-    def __init__(self):
-        self.dd_hard = 0.35
-        self.beta_hard = 2.5
-        
-    def percentile_to_score(self, percentile):
-        if percentile <= 30: return 1.0
-        elif percentile <= 60: return 0.7
-        elif percentile <= 80: return 0.4
-        else: return 0.1 # Rủi ro cao
+        latest = tech_df.iloc[-1]
+        rsi = latest.get('rsi14', np.nan)
 
-    def score_symbol(self, symbol, rec, all_records=None):
-        dd = rec.get('dd_3m', 0)
-        beta = rec.get('beta_3m', 1)
-        if dd > self.dd_hard or beta > self.beta_hard:
-            return {'symbol': symbol, 'score': 0, 'hard_reject': True}
-        
-        scores = []
-        for key in ['pct_beta_3m', 'pct_dd_3m', 'pct_vol_3m']:
-            val = rec.get(key)
-            if val is not None:
-                scores.append(self.percentile_to_score(val * 100)) # val là 0-1, function nhận 0-100
-        
-        base_score = np.mean(scores) * 5.0 if scores else 2.5 # Quy về thang 5
-        
-        if dd > 0.25: base_score = min(base_score, 3.0)
-        if beta > 2.0: base_score = min(base_score, 3.0)
-        
-        return {'symbol': symbol, 'score': max(0, round(base_score, 2)), 'hard_reject': False}
+        slope = metrics['slope']
+        r_squared = metrics['r_squared']
+        z_score = metrics['z_score']
+        vol_corr = metrics['vol_corr']
+        slope_pct = metrics.get('slope_pct', np.nan)
+        t_stat = metrics.get('t_stat', np.nan)
 
-# %%
+        def _clamp01(x):
+            return max(0.0, min(1.0, x))
+
+        details = {}
+
+        # Pillar 1: Trend Quality (continuous score, use %slope + t-stat)
+        slope_gain = 800.0
+        if pd.notna(slope_pct):
+            slope_score = (np.tanh(slope_pct * slope_gain) + 1) / 2  # 0..1
+        else:
+            slope_score = 0.5
+
+        if pd.notna(t_stat):
+            t_score = (np.tanh(t_stat / 2.0) + 1) / 2
+        else:
+            t_score = 0.5
+
+        p1_score = 0.55 * slope_score + 0.45 * t_score
+        details['P1'] = {
+            'score': round(p1_score * 5, 3),
+            'slope': slope,
+            'slope_pct': slope_pct,
+            't_stat': t_stat,
+            'r_squared': r_squared
+        }
+
+        # Pillar 2: Mean Reversion Risk (continuous score, lower z/rsi is better)
+        z_score_val = z_score if pd.notna(z_score) else 0.0
+        z_score_norm = (np.tanh(-z_score_val / 1.5) + 1) / 2  # 0..1
+        if pd.notna(rsi):
+            rsi_score = _clamp01((80 - rsi) / 50)  # rsi 30->1, 80->0
+        else:
+            rsi_score = 0.5
+        p2_score = 0.6 * z_score_norm + 0.4 * rsi_score
+        details['P2'] = {
+            'score': round(p2_score * 5, 3),
+            'z_score': z_score,
+            'rsi': rsi
+        }
+
+        # Pillar 3: Money Flow Validation (continuous score)
+        if pd.notna(vol_corr):
+            vol_score = (np.tanh(vol_corr * 3) + 1) / 2
+        else:
+            vol_score = 0.5
+        p3_score = vol_score
+        details['P3'] = {
+            'score': round(p3_score * 5, 3),
+            'vol_corr': vol_corr
+        }
+
+        # Base trend score (P1 + P3) then apply risk as a multiplicative filter (P2)
+        base_trend_score = (0.65 * p1_score + 0.35 * p3_score) * 5
+        risk_filter = 0.2 + 0.8 * p2_score
+        total_score = base_trend_score * risk_filter
+
+        trend_strength = 0.0
+        if pd.notna(r_squared):
+            trend_strength = np.tanh(slope) * max(min(r_squared, 1.0), 0.0)
+
+        final_score = _clamp01(total_score / 5) * 5
+
+        return {
+            'symbol': symbol,
+            'score': round(final_score, 3),
+            'base_score': round(total_score, 3),
+            'trend_strength': trend_strength,
+            'trend_metrics': {
+                'slope': slope,
+                'r_squared': r_squared,
+                'z_score': z_score,
+                'rsi': rsi,
+                'vol_corr': vol_corr,
+                'slope_pct': slope_pct,
+                't_stat': t_stat
+            },
+            'details': details
+        }
+
+#%%
+def fetch_outstanding_shares(symbol_list, start_date, end_date):
+    shares_map = {}
+    for sym in symbol_list:
+        try:
+            params = {
+                "symbol": sym,
+                "start_date": start_date,
+                "end_date": end_date
+            }
+            r = requests.get(
+                "http://192.168.8.190:8000/MKD/outstanding_shares",
+                params=params,
+                timeout=15
+            )
+            if r.status_code != 200:
+                continue
+
+            data = r.json()
+
+            if isinstance(data, list) and len(data) > 0:
+                # Pick the latest by date
+                try:
+                    latest = max(data, key=lambda x: x.get('date', ''))
+                except Exception:
+                    latest = data[-1]
+                shares = latest.get('outstanding_shares', 0)
+            elif isinstance(data, dict):
+                shares = data.get('outstanding_shares', 0)
+            else:
+                shares = 0
+
+            if shares and shares > 0:
+                shares_map[sym] = shares
+        except Exception:
+            continue
+
+    return shares_map
+
+#%%    
 def calculate_foreign_investor_metrics(symbol_list, start_date, end_date):
     all_data = {}
-    
+
+    outstanding_map = fetch_outstanding_shares(symbol_list, start_date, end_date)
+
+    price_map = {}
+    stock_data_temp = APIFetcher.fetch_batch(
+        "http://192.168.8.190:8000/MKD/stock_daily",
+        symbol_list, end_date, end_date, timeout_secs=30
+    )
+    for sym, df in stock_data_temp.items():
+        if df is not None and len(df) > 0:
+            price_map[sym] = df['close'].iloc[-1] if 'close' in df.columns else 10000
+
     for sym in symbol_list:
         try:
             params = {"symbol": sym, "start_date": start_date, "end_date": end_date}
@@ -225,60 +368,207 @@ def calculate_foreign_investor_metrics(symbol_list, start_date, end_date):
                 data = r.json()
                 if data:
                     df = pd.DataFrame(data) if isinstance(data, list) else pd.DataFrame([data])
-                    for dc in ['date', 'trading_date']: 
-                        if dc in df.columns: 
-                            df[dc] = pd.to_datetime(df[dc]); df=df.sort_values(dc); break
-                    
-                    df['nff'] = df['buy_value'] - df['sell_value']
-                    df['ffr'] = df['buy_value'] / (df['buy_value'] + df['sell_value']).replace(0, np.nan)
-                    df['room_delta'] = df['current_room'].diff()
-                    
+                    if 'date' in df.columns:
+                        df['date'] = pd.to_datetime(df['date'])
+                        df = df.sort_values('date')
+                    elif 'trading_date' in df.columns:
+                        df['trading_date'] = pd.to_datetime(df['trading_date'])
+                        df = df.sort_values('trading_date')
+
+                    df['nff_vol'] = df['buy_volume'] - df['sell_volume']
+                    df['f_activity'] = df['buy_volume'] + df['sell_volume']
+
                     if len(df) >= 5:
-                        nff_5d = df['nff'].tail(5).sum()
-                        ffr_5d = df['ffr'].tail(5).mean()
-                        room_delta_5d = df['current_room'].iloc[-1] - df['current_room'].iloc[-5]
+                        recent = df.tail(5)
+                        nff_5d_vol = recent['nff_vol'].sum()
+                        total_5d_buy_value = recent['buy_value'].sum()
+                        total_5d_sell_value = recent['sell_value'].sum()
+                        avg_activity = recent['f_activity'].mean()
                     else:
-                        nff_5d = df['nff'].sum()
-                        ffr_5d = df['ffr'].mean()
-                        room_delta_5d = 0
-                        
-                    latest = {
-                        'nff_1d': df['nff'].iloc[-1],
-                        'ffr_1d': df['ffr'].iloc[-1],
-                        'room_delta_1d': df['room_delta'].iloc[-1],
-                        'nff_5d': nff_5d,
-                        'ffr_5d': ffr_5d,
-                        'room_delta_5d': room_delta_5d
+                        nff_5d_vol = df['nff_vol'].sum()
+                        total_5d_buy_value = df['buy_value'].sum()
+                        total_5d_sell_value = df['sell_value'].sum()
+                        avg_activity = df['f_activity'].mean()
+
+                    latest = df.iloc[-1]
+
+                    shares = outstanding_map.get(sym, 1e9)
+                    price = price_map.get(sym, 10000)
+
+                    nff_5d_value = nff_5d_vol * price
+                    activity_value = avg_activity * price
+                    market_cap = shares * price
+                    
+                    # Use absolute buy/sell values to avoid negative bias
+                    total_5d_activity_value = total_5d_buy_value + total_5d_sell_value
+
+                    all_data[sym] = {
+                        'nff_1d_vol': latest['nff_vol'],
+                        'nff_5d_vol': nff_5d_vol,
+                        'avg_f_activity': avg_activity,
+                        'nff_5d_value': nff_5d_value,
+                        'activity_value': activity_value,
+                        'market_cap': market_cap,
+                        'nff_5d_pct': (nff_5d_vol / shares * 100) if shares > 0 else 0,
+                        'activity_pct': (avg_activity / shares * 100) if shares > 0 else 0,
+                        'total_5d_activity_value': total_5d_activity_value,
                     }
-                    all_data[sym] = latest
-        except: pass
-        
-    metrics = ['nff_5d', 'ffr_5d', 'room_delta_5d', 'nff_1d', 'ffr_1d', 'room_delta_1d']
-    for m in metrics:
-        vals = [d[m] for d in all_data.values() if d.get(m) is not None and not np.isnan(d.get(m))]
-        if not vals: continue
-        
+        except Exception as e:
+            print(f"Error processing {sym}: {e}")
+
+    # Value metrics: use absolute total activity instead of net NFF
+    value_metrics = ['total_5d_activity_value', 'activity_value']
+    for m in value_metrics:
+        vals = [d[m] for d in all_data.values() if d.get(m) is not None]
+        if not vals:
+            continue
+
         for sym in all_data:
-            val = all_data[sym].get(m)
-            if val is not None and not np.isnan(val):
-                rank = sum(1 for v in vals if v < val)
-                pct = rank / len(vals) if len(vals) > 0 else 0.5
-                all_data[sym][f'pct_{m}'] = pct
-                
+            val = all_data[sym].get(m, 0)
+            rank = sum(1 for v in vals if val > v)
+            all_data[sym][f'score_val_{m}'] = rank / len(vals) if len(vals) > 0 else 0
+
+    # Absolute volume metrics (using abs value for NFF)
+    abs_metrics = [('abs_nff_5d_vol', 'nff_5d_vol'), ('avg_f_activity', 'avg_f_activity')]
+    for score_name, metric in abs_metrics:
+        vals = [abs(d[metric]) for d in all_data.values() if d.get(metric) is not None]
+        if not vals:
+            continue
+
+        for sym in all_data:
+            val = abs(all_data[sym].get(metric, 0))
+            rank = sum(1 for v in vals if val > v)
+            all_data[sym][f'score_abs_{score_name}'] = rank / len(vals) if len(vals) > 0 else 0
+
+    # Percentage metrics (allow negative for net flow direction)
+    pct_metrics = ['nff_5d_pct', 'activity_pct']
+    for m in pct_metrics:
+        vals = [d[m] for d in all_data.values() if d.get(m) is not None]
+        if not vals:
+            continue
+
+        for sym in all_data:
+            val = all_data[sym].get(m, 0)
+            if m.startswith('nff') and val < 0:
+                all_data[sym][f'score_pct_{m}'] = 0
+            else:
+                rank = sum(1 for v in vals if val > v)
+                all_data[sym][f'score_pct_{m}'] = rank / len(vals) if len(vals) > 0 else 0
+
     return all_data
 
+#%%
+class ForeignInvestorScorer:
+    def __init__(self, mega_caps=None, large_caps=None):
+        self.weights = {
+            'val_total_activity': 2.0,  # Absolute trading activity (buy+sell)
+            'val_activity': 1.5,         # Average daily activity
+            'pct_nff_5d': 0.3,          # Net flow percentage (small weight)
+        }
+        # Use provided bluechips or defaults
+        self.mega_caps = mega_caps if mega_caps is not None else ['VIC', 'VHM', 'VRE']
+        self.large_caps = large_caps if large_caps is not None else ['NVL', 'KDH', 'DXG', 'BCM', 'NLG', 'KBC', 'HDG']
+        
+    def score_symbol(self, symbol, fi_dict):
+        if not fi_dict: 
+            return {'symbol': symbol, 'score': 0}
+        
+        score = 0.0
+
+        # Score based on absolute trading activity (not net flow)
+        val_score = 0.0
+        if 'score_val_total_5d_activity_value' in fi_dict:
+            val_score += fi_dict.get('score_val_total_5d_activity_value', 0) * self.weights['val_total_activity']
+        
+        val_score += fi_dict.get('score_val_activity_value', 0) * self.weights['val_activity']
+
+        # Smaller weight on percentage metrics (net flow direction)
+        pct_score = 0.0
+        pct_score += fi_dict.get('score_pct_nff_5d_pct', 0) * self.weights['pct_nff_5d']
+
+        mcap = fi_dict.get('market_cap', 0)
+        
+        # For large caps: emphasize absolute activity
+        if mcap >= 5e12:
+            score = val_score * 1.5
+        elif mcap >= 1e12:
+            score = val_score * 1.2
+        else:
+            # For small caps: also primarily use activity, but allow pct modifier
+            score = val_score + pct_score * 0.3
+
+        # Positive NFF bonus for bluechips and large caps
+        nff = fi_dict.get('nff_5d_vol', 0)
+        if symbol in self.mega_caps:
+            if nff > 0:
+                score *= 1.3
+            elif nff < 0:
+                score *= 0.8  # Reduced penalty for temporary selling
+        elif symbol in self.large_caps:
+            if nff > 0:
+                score *= 1.2
+            elif nff < 0:
+                score *= 0.85
+
+        return {'symbol': symbol, 'score': round(min(score, 5.0), 3)}
+    
+# %%
+class RiskControlScorer:
+    def __init__(self):
+        self.max_dd_threshold = 0.4
+        self.min_adv_threshold = 5e9
+        self.min_price_threshold = 10000
+        
+    def score_symbol(self, symbol, rec):
+        if not rec: 
+            return {'symbol': symbol, 'score': 0, 'status': 'No Data'}
+        
+        base_score = 5.0
+        penalties = {}
+
+        adv = rec.get('adv_20', 0)
+        if adv < self.min_adv_threshold:
+            penalty = 2.0 if adv < (self.min_adv_threshold / 2) else 1.0
+            base_score -= penalty
+            penalties['Liquidity'] = f"-{penalty} (ADV: {adv/1e9:.1f}B)"
+
+        price = rec.get('close_last', 0)
+        if price < self.min_price_threshold:
+            base_score -= 1.5
+            penalties['Penny'] = "-1.5 (Price < 10k)"
+
+        dd = rec.get('dd_3m', 0)
+        if dd > self.max_dd_threshold:
+            penalty = round((dd / self.max_dd_threshold) * 1.0, 2)
+            base_score -= penalty
+            penalties['Drawdown'] = f"-{penalty} (DD: {dd:.1%})"
+
+        pct_beta = rec.get('pct_beta_3m', 0.5)
+        if pct_beta > 0.8:
+            base_score -= 0.5
+            penalties['High Beta'] = "-0.5"
+
+        final_score = max(0, round(base_score, 2))
+        
+        return {
+            'symbol': symbol, 
+            'score': final_score, 
+            'hard_reject': False,
+            'penalties': penalties
+        }
+    
 # %%
 def calculate_risk_metrics(df, symbol=None):
         if df is None or len(df) < 20:
             return {}
     
-        close = df['close'].dropna()
+        close = df['adj_close'].dropna()
         if len(close) < 20:
             return {}
     
         metrics = {}
+        metrics['close_last'] = close.iloc[-1]
     
-        # 1. MAX DRAWDOWN 3M (60 trading days)
         lookback_3m = min(60, len(close))
         prices_3m = close.iloc[-lookback_3m:]
         running_max = prices_3m.expanding().max()
@@ -286,13 +576,11 @@ def calculate_risk_metrics(df, symbol=None):
         max_dd = drawdown.min()
         metrics['dd_3m'] = abs(max_dd) if max_dd < 0 else 0.0
     
-        # 2. ANNUALIZED VOLATILITY 3M (60 trading days)
         if len(prices_3m) >= 2:
             log_returns = np.log(prices_3m / prices_3m.shift(1)).dropna()
             vol_3m = log_returns.std() * np.sqrt(252)  # Annualize by 252 trading days
             metrics['vol_3m'] = vol_3m
     
-        # 3. VALUE AT RISK (VaR) & CONDITIONAL VaR (CVaR) 1M (20 trading days)
         lookback_1m = min(20, len(close))
         prices_1m = close.iloc[-lookback_1m:]
         if len(prices_1m) >= 2:
@@ -303,7 +591,6 @@ def calculate_risk_metrics(df, symbol=None):
             cvar_95 = log_returns_1m[log_returns_1m <= var_95].mean()
             metrics['cvar_1m'] = abs(cvar_95) if cvar_95 < 0 else 0.0
     
-        # 4. AVERAGE DAILY VALUE TRADED 20D (ADV)
         volume_col = None
         for col in ['volume', 'Volume', 'vol']:
             if col in df.columns:
@@ -319,7 +606,7 @@ def calculate_risk_metrics(df, symbol=None):
             daily_value = prices_20d.values * volume_20d.values
             adv_20 = np.mean(daily_value)  # Average daily value (VND)
             metrics['adv_20'] = adv_20
-    
+        
         return metrics
 
 
@@ -379,8 +666,10 @@ def calculate_risk_metrics_batch(symbol_list, stock_data):
     return records
 
 # %%
-def analyze_symbols(symbol_list, start_date, end_date):
-    print(f"Starting Technical & Risk Analysis for {len(symbol_list)} symbols...")
+def analyze_symbols(symbol_list, start_date, end_date, industry='Real Estate', year=2025, quarter=3):    
+    bluechip_data = get_cached_bluechips(industry, symbol_list, year, quarter)
+    mega_caps = bluechip_data.get('mega_caps', [])
+    large_caps = bluechip_data.get('large_caps', [])
     
     # 1. Fetch Stock Data
     stock_data = APIFetcher.fetch_batch(
@@ -400,7 +689,6 @@ def analyze_symbols(symbol_list, start_date, end_date):
         vni_series = vni_df[col]
 
     # 3. Technical Scoring
-    print("Calculating Technical Scores...")
     tech_scorer = TechnicalAnalysisScorer()
     tech_scores = {}
     for sym in symbol_list:
@@ -411,24 +699,21 @@ def analyze_symbols(symbol_list, start_date, end_date):
                 tech_scores[sym] = tech_scorer.score_symbol(sym, df_tech, vni_series)
 
     # 4. Foreign Scoring
-    print("Calculating Foreign Scores...")
     fi_data = calculate_foreign_investor_metrics(symbol_list, start_date, end_date)
-    fi_scorer = ForeignInvestorScorer()
+    fi_scorer = ForeignInvestorScorer(mega_caps=mega_caps, large_caps=large_caps)
     foreign_scores = {}
     for sym, data in fi_data.items():
         foreign_scores[sym] = fi_scorer.score_symbol(sym, data)
 
     # 5. Risk Scoring
-    print("Calculating Risk Scores...")
     risk_scorer = RiskControlScorer()
     risk_records = calculate_risk_metrics_batch(symbol_list, stock_data)
-    # Map record theo symbol để dễ tra cứu
     risk_map = {r['symbol']: r for r in risk_records}
     
     risk_scores = {}
     for sym in symbol_list:
         if sym in risk_map:
-            risk_scores[sym] = risk_scorer.score_symbol(sym, risk_map[sym], risk_records)
+            risk_scores[sym] = risk_scorer.score_symbol(sym, risk_map[sym])
         else:
             risk_scores[sym] = {'symbol': sym, 'score': 0}
 
