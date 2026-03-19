@@ -1,6 +1,6 @@
 # %%
 import pandas as pd
-import TechAna
+import TechAna_DRAFT as TechAna
 from TechAna_DRAFT import START_DATE, END_DATE
 
 try:
@@ -64,8 +64,8 @@ def get_total_score(start_date, end_date, industry='RealEstate', year=None, quar
     df_total = pd.DataFrame(final_rows)
     
     W_FUND = 0.2
-    W_TECH = 0.45
-    W_FOREIGN = 0.3
+    W_TECH = 0.4
+    W_FOREIGN = 0.35
     W_RISK = 0.1
 
     df_total['Final_Score'] = (
@@ -80,7 +80,7 @@ def get_total_score(start_date, end_date, industry='RealEstate', year=None, quar
     df_total['Rank'] = df_total.index + 1
 
     cols_to_round = ['Final_Score']
-    df_total[cols_to_round] = df_total[cols_to_round].round(2)
+    df_total[cols_to_round] = df_total[cols_to_round].round(4)
 
     display_df = df_total[[
         'Rank', 'Symbol', 
@@ -100,3 +100,5 @@ if __name__ == "__main__":
         print(display_df.to_string(index=False))
     else:
         print("No data validated for analysis.")
+
+# %%

@@ -227,12 +227,17 @@ def calculate_drawdown_3m(df):
     return metrics.get('dd_3m')
 
 
-def calculate_risk_metrics_batch(symbol_list, stock_data):
+def calculate_risk_metrics_batch(symbol_list, stock_data, start_date=None, end_date=None):
     records = []
 
     beta_map = {}
     try:
-        resp = requests.get("http://192.168.8.190:8000/MKD/beta_calculation", timeout=60)
+        beta_params = {}
+        if start_date:
+            beta_params['start_date'] = start_date
+        if end_date:
+            beta_params['end_date'] = end_date
+        resp = requests.get("http://192.168.8.190:8000/MKD/beta_calculation", params=beta_params if beta_params else None, timeout=60)
         if resp.status_code == 200:
             beta_json = resp.json()
             df_beta = pd.DataFrame(beta_json if isinstance(beta_json, list) else [beta_json])
@@ -255,7 +260,10 @@ def calculate_risk_metrics_batch(symbol_list, stock_data):
 
     market_cap_map = {}
     try:
-        resp = requests.get("http://192.168.8.190:8000/MKD/stock-ratios", timeout=60)
+        cap_params = {}
+        if end_date:
+            cap_params['end_date'] = end_date
+        resp = requests.get("http://192.168.8.190:8000/MKD/stock-ratios", params=cap_params if cap_params else None, timeout=60)
         if resp.status_code == 200:
             cap_json = resp.json()
             df_cap = pd.DataFrame(cap_json if isinstance(cap_json, list) else [cap_json])

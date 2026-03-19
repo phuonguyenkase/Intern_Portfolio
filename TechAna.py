@@ -4,9 +4,10 @@ import pandas as pd
 import numpy as np
 from Bluechip import get_cached_bluechips
 
-START_DATE = "2025-07-01"
-END_DATE = "2025-09-30"
+START_DATE = "2022-10-01"
+END_DATE = "2022-12-30"
 
+# %%
 class APIFetcher:    
     @staticmethod
     def fetch_batch(url, symbol_list, start_date, end_date, timeout_secs=60):
@@ -151,7 +152,6 @@ def calculate_trend_strength(df, symbol=None):
 
 
 class TechnicalAnalysisScorer:
-    """Đánh giá technical score với multi-timeframe trend analysis"""
     def __init__(self):
         self.criteria = [
             # Short-term momentum
@@ -581,13 +581,22 @@ def calculate_drawdown_3m(df):
     return metrics.get('dd_3m')
 
 
-def calculate_risk_metrics_batch(symbol_list, stock_data):
+def calculate_risk_metrics_batch(symbol_list, stock_data, start_date=None, end_date=None):
     records = []
 
     # Attempt to fetch beta metrics in one call
     beta_map = {}
     try:
-        resp = requests.get("http://192.168.8.190:8000/MKD/beta_calculation", timeout=60)
+        beta_params = {}
+        if start_date:
+            beta_params['start_date'] = start_date
+        if end_date:
+            beta_params['end_date'] = end_date
+        resp = requests.get(
+            "http://192.168.8.190:8000/MKD/beta_calculation",
+            params=beta_params if beta_params else None,
+            timeout=60
+        )
         if resp.status_code == 200:
             beta_json = resp.json()
             df_beta = pd.DataFrame(beta_json if isinstance(beta_json, list) else [beta_json])
@@ -636,8 +645,6 @@ def analyze_symbols(symbol_list, start_date, end_date, industry='Real Estate', y
     bluechip_data = get_cached_bluechips(industry, symbol_list, year, quarter)
     mega_caps = bluechip_data.get('mega_caps', [])
     large_caps = bluechip_data.get('large_caps', [])
-    print(f"[{industry}] Mega Caps: {mega_caps}")
-    print(f"[{industry}] Large Caps: {large_caps}")
     
     # 1. Fetch Stock Data
     stock_data = APIFetcher.fetch_batch(
@@ -675,7 +682,7 @@ def analyze_symbols(symbol_list, start_date, end_date, industry='Real Estate', y
 
     # 5. Risk Scoring
     risk_scorer = RiskControlScorer()
-    risk_records = calculate_risk_metrics_batch(symbol_list, stock_data)
+    risk_records = calculate_risk_metrics_batch(symbol_list, stock_data, start_date, end_date)
     risk_map = {r['symbol']: r for r in risk_records}
     
     risk_scores = {}

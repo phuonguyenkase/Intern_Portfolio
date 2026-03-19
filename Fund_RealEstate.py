@@ -3,6 +3,10 @@ import requests
 import pandas as pd
 import os
 import TechAna_DRAFT as TechAna
+from Filtering_Stock import filter_stocks_by_price_and_liquidity
+
+START_DATE = TechAna.START_DATE
+END_DATE = TechAna.END_DATE
 
 all_stocks = []
 RealEstate_symbols = []
@@ -10,6 +14,7 @@ all_ratios_data = []
 df_ratios = pd.DataFrame()
 RealEstate_ratios_data = {}
 as_of_date = os.getenv("Fund_AsOf_Date")
+as_of_ts = None
 
 # Make exports safe even if fetch or scoring fails
 combined_scores_draft = pd.DataFrame()
@@ -19,74 +24,21 @@ try:
     r = requests.get("http://192.168.8.190:8000/MKD/stock_info")
     r.raise_for_status()
     all_stocks = r.json()
-    RealEstate_symbols = [
-        s.get('symbol')
-        for s in all_stocks
-        if isinstance(s, dict)
-        and s.get('industry_lv1') == 'Financials'
+    filtered_stocks = [
+        s for s in all_stocks
+        if s.get('industry_lv1') == 'Financials'
         and s.get('industry_lv2') == 'Real Estate'
-        and s.get('symbol')
     ]
-    if not RealEstate_symbols:
-        RealEstate_symbols = [s for s in all_stocks if isinstance(s, str)]
+    filtered_stocks = filter_stocks_by_price_and_liquidity(
+        filtered_stocks,
+        min_price=11000,
+        min_volume_threshold=20000,
+        min_pass_rate=0.50,
+        start_date=getattr(TechAna, 'START_DATE', None),
+        end_date=getattr(TechAna, 'END_DATE', None),
+    )
+    RealEstate_symbols = [s['symbol'] for s in filtered_stocks]
 
-    min_price = 10000
-    price_date = getattr(TechAna, 'END_DATE', None)
-    if price_date and RealEstate_symbols:
-        price_params = {
-            "symbols": ",".join(RealEstate_symbols),
-            "start_date": price_date,
-            "end_date": price_date
-        }
-        r = requests.get(
-            "http://192.168.8.190:8000/MKD/stock_daily",
-            params=price_params,
-            headers={"accept": "application/json"},
-            timeout=30
-        )
-        r.raise_for_status()
-        price_payload = r.json()
-        price_items = []
-        if isinstance(price_payload, dict):
-            for sym, rows in price_payload.items():
-                if isinstance(rows, list):
-                    for row in rows:
-                        if isinstance(row, dict):
-                            row = {**row, "symbol": row.get("symbol", sym)}
-                            price_items.append(row)
-                elif isinstance(rows, dict):
-                    row = {**rows, "symbol": rows.get("symbol", sym)}
-                    price_items.append(row)
-        elif isinstance(price_payload, list):
-            price_items = price_payload
-
-        price_map = {}
-        for row in price_items:
-            if not isinstance(row, dict):
-                continue
-            sym = row.get('symbol')
-            if not sym:
-                continue
-            price = row.get('adj_close')
-            if price is None:
-                price = row.get('close')
-            if price is None:
-                continue
-            try:
-                price_map[sym] = float(price)
-            except (TypeError, ValueError):
-                continue
-
-        if price_map:
-            min_price_symbols = {s for s, v in price_map.items() if v >= min_price}
-            RealEstate_symbols = [s for s in RealEstate_symbols if s in min_price_symbols]
-        else:
-            # If price_map is empty, no stocks passed price filter
-            RealEstate_symbols = []
-    else:
-        # If price_date is missing or no symbols, clear the list
-        RealEstate_symbols = []
-    
     url = "http://192.168.8.190:8000/MKD/stock-ratios"
     params = {
         "symbols": ",".join(RealEstate_symbols),
@@ -99,49 +51,6 @@ try:
     r.raise_for_status()
     all_ratios_data.extend(r.json())
 
-    url_daily = "http://192.168.8.190:8000/MKD/stock-ratios-daily"
-    daily_params = {
-        "symbols": ",".join(RealEstate_symbols),
-        "codes": "30022",
-        "start_date": "2025-11-01",
-        "end_date": "2025-12-31"
-    }
-    r = requests.get(url_daily, params=daily_params, headers={"accept": "application/json"})
-    r.raise_for_status()
-    daily_payload = r.json()
-    if isinstance(daily_payload, dict):
-        daily_data = daily_payload.get('data', [])
-    else:
-        daily_data = daily_payload
-
-    matching_volume_sum = {}
-    matching_volume_count = {}
-    for record in daily_data:
-        if not isinstance(record, dict):
-            continue
-        if str(record.get('code')) != '30022':
-            continue
-        symbol = record.get('symbol')
-        value = record.get('value')
-        if symbol and value is not None:
-            matching_volume_sum[symbol] = matching_volume_sum.get(symbol, 0.0) + float(value)
-            matching_volume_count[symbol] = matching_volume_count.get(symbol, 0) + 1
-
-    matching_volume_12_2025 = {
-        symbol: matching_volume_sum[symbol] / matching_volume_count[symbol]
-        for symbol in matching_volume_sum
-        if matching_volume_count.get(symbol, 0) > 0
-    }
-
-    # Sort by average matching volume December 2025 and take top 50
-    filtered_stocks = sorted(
-        RealEstate_symbols,
-        key=lambda s: float(matching_volume_12_2025.get(s, float('-inf'))),
-        reverse=True
-    )
-    top_50_stocks = filtered_stocks[:50]
-    RealEstate_symbols = top_50_stocks
-
     df_ratios = pd.DataFrame(all_ratios_data)
 
     if not as_of_date:
@@ -150,6 +59,16 @@ try:
             if pd.notna(end_dt):
                 prev_q_end = (end_dt.to_period('Q') - 1).end_time
                 as_of_date = prev_q_end.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
+    # Guard against look-ahead bias by cutting fundamental data at as_of_date.
+    if as_of_date:
+        try:
+            as_of_ts = pd.to_datetime(as_of_date, errors="coerce")
+            if pd.notna(as_of_ts) and not df_ratios.empty and 'date' in df_ratios.columns:
+                ratio_dates = pd.to_datetime(df_ratios['date'], errors='coerce')
+                df_ratios = df_ratios[ratio_dates.notna() & (ratio_dates <= as_of_ts)].copy()
         except Exception:
             pass
 
@@ -799,7 +718,7 @@ class RelativeValuationScorer:
             return None
         return float((peer <= latest_value).mean())
 
-    def evaluate_criterion(self, realestate_df, criterion, all_realestate_data):
+    def evaluate_criterion(self, realestate_df, criterion, all_realestate_data, peer_data_cache=None):
         """Evaluate a single criterion using latest (most recent) value only"""
         try:
             crit_type = criterion['type']
@@ -836,7 +755,11 @@ class RelativeValuationScorer:
                 if latest is None:
                     return {'pass': False, 'reason': f'Code {code} not found', 'value': None}
 
-                peer_values = [self.get_metric_value(df, code) for df in all_realestate_data.values()]
+                # Use pre-computed peer_data_cache if available
+                if peer_data_cache and code in peer_data_cache:
+                    peer_values = peer_data_cache[code]
+                else:
+                    peer_values = [self.get_metric_value(df, code) for df in all_realestate_data.values()]
                 pct = self._ecdf_percentile(latest, peer_values)
                 if pct is None:
                     return {'pass': False, 'reason': 'No peer values', 'value': latest}
@@ -872,12 +795,12 @@ class RelativeValuationScorer:
         except Exception as e:
             return {'pass': False, 'reason': str(e)}
 
-    def score_realestate(self, symbol, realestate_df, all_realestate_data):
+    def score_realestate(self, symbol, realestate_df, all_realestate_data, peer_data_cache=None):
         results = {}
         points = 0.0
 
         for crit in self.criteria:
-            result = self.evaluate_criterion(realestate_df, crit, all_realestate_data)
+            result = self.evaluate_criterion(realestate_df, crit, all_realestate_data, peer_data_cache)
             results[f"C{crit['id']}"] = result
             if result['pass']:
                 points += crit.get('weight', 0)
@@ -891,10 +814,17 @@ class RelativeValuationScorer:
 # %%
 try:
     val_scorer = RelativeValuationScorer()
+    
+    # Setup peer_data_cache for RelativeValuationScorer
+    val_peer_data_cache = {}
+    val_metric_codes = ['ryd25', 'ryd21']
+    for code in val_metric_codes:
+        val_peer_data_cache[code] = [val_scorer.get_metric_value(df, code) for df in RealEstate_ratios_data.values()]
+    
     val_scores = {}
 
     for symbol, realestate_df in RealEstate_ratios_data.items():
-        val_scores[symbol] = val_scorer.score_realestate(symbol, realestate_df, RealEstate_ratios_data)    
+        val_scores[symbol] = val_scorer.score_realestate(symbol, realestate_df, RealEstate_ratios_data, val_peer_data_cache)    
     
     # Build combined scores
     combined_scores_draft = pd.DataFrame({

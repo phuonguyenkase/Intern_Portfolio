@@ -48,7 +48,6 @@ def _parse_stock_payload(payload):
             df['date'] = pd.to_datetime(df[col], errors='coerce')
             break
 
-    # Use Adj Close for all OHLC if available
     if 'adj_close' in df.columns:
         adj = pd.to_numeric(df['adj_close'], errors='coerce')
         df['open'] = adj

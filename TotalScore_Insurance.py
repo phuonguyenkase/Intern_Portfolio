@@ -48,17 +48,17 @@ def get_total_score(start_date, end_date, industry='Insurance', year=None, quart
 
     final_rows = []
     for sym in symbols_to_analyze:
-        f_score_raw = fund_map.get(sym, 0)                  
-        t_score_raw = tech_scores.get(sym, {}).get('score', 0)    
-        fo_score_raw = foreign_scores.get(sym, {}).get('score', 0) 
-        r_score_raw = risk_scores.get(sym, {}).get('score', 0)    
-        
+        f_score_raw = fund_map.get(sym, 0)
+        t_score_raw = tech_scores.get(sym, {}).get('score', 0)
+        fo_score_raw = foreign_scores.get(sym, {}).get('score', 0)
+        r_score_raw = risk_scores.get(sym, {}).get('score', 0)
+
         final_rows.append({
             'Symbol': sym,
-            'Fund_Score': f_score_raw/20.0, 
-            'Tech_Score': t_score_raw/5.0,      
-            'Foreign_Score': fo_score_raw/5.0,  
-            'Risk_Score': r_score_raw/5.0       
+            'Fund_Score': f_score_raw / 20.0,
+            'Tech_Score': t_score_raw / 5.0,
+            'Foreign_Score': fo_score_raw / 5.0,
+            'Risk_Score': r_score_raw / 5.0
         })
 
     df_total = pd.DataFrame(final_rows)
@@ -75,21 +75,18 @@ def get_total_score(start_date, end_date, industry='Insurance', year=None, quart
         W_RISK * (df_total['Risk_Score'])
     )
 
-    # Sắp xếp và xếp hạng
     df_total = df_total.sort_values(by='Final_Score', ascending=False).reset_index(drop=True)
     df_total['Rank'] = df_total.index + 1
 
-    # Làm tròn số hiển thị
     cols_to_round = ['Final_Score']
     df_total[cols_to_round] = df_total[cols_to_round].round(2)
 
-    # Đổi tên cột hiển thị cho đẹp
     display_df = df_total[[
-        'Rank', 'Symbol', 
+        'Rank', 'Symbol',
         'Fund_Score',
         'Tech_Score',
-        'Foreign_Score', 
-        'Risk_Score', 
+        'Foreign_Score',
+        'Risk_Score',
         'Final_Score'
     ]]
 

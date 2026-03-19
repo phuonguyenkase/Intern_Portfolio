@@ -4,6 +4,10 @@ import pandas as pd
 import numpy as np
 import os
 import TechAna_DRAFT as TechAna
+from Filtering_Stock import filter_stocks_by_price_and_liquidity
+
+START_DATE = TechAna.START_DATE
+END_DATE = TechAna.END_DATE
 
 uti_ene = ['Utilities', 'Oil & Gas']
 all_stocks = []
@@ -12,6 +16,7 @@ all_ratios_data = []
 df_ratios = pd.DataFrame()
 uti_ene_ratios_data = {}
 as_of_date = os.getenv("Fund_AsOf_Date")
+as_of_ts = None
 
 # Make exports safe even if fetch or scoring fails
 combined_scores_draft = pd.DataFrame()
@@ -24,102 +29,15 @@ try:
     filtered_stocks = [
         s for s in all_stocks
         if s.get('industry_lv1') in uti_ene]
-    uti_ene_symbols = [s['symbol'] for s in filtered_stocks]
-
-    min_price = 10000
-    price_date = getattr(TechAna, 'END_DATE', None)
-    if price_date and uti_ene_symbols:
-        price_params = {
-            "symbols": ",".join(uti_ene_symbols),
-            "start_date": price_date,
-            "end_date": price_date
-        }
-        r = requests.get(
-            "http://192.168.8.190:8000/MKD/stock_daily",
-            params=price_params,
-            headers={"accept": "application/json"},
-            timeout=30
-        )
-        r.raise_for_status()
-        price_payload = r.json()
-        price_items = []
-        if isinstance(price_payload, dict):
-            for sym, rows in price_payload.items():
-                if isinstance(rows, list):
-                    for row in rows:
-                        if isinstance(row, dict):
-                            row = {**row, "symbol": row.get("symbol", sym)}
-                            price_items.append(row)
-                elif isinstance(rows, dict):
-                    row = {**rows, "symbol": rows.get("symbol", sym)}
-                    price_items.append(row)
-        elif isinstance(price_payload, list):
-            price_items = price_payload
-
-        price_map = {}
-        for row in price_items:
-            if not isinstance(row, dict):
-                continue
-            sym = row.get('symbol')
-            if not sym:
-                continue
-            price = row.get('adj_close')
-            if price is None:
-                price = row.get('close')
-            if price is None:
-                continue
-            try:
-                price_map[sym] = float(price)
-            except (TypeError, ValueError):
-                continue
-
-        if price_map:
-            min_price_symbols = {s for s, v in price_map.items() if v >= min_price}
-            filtered_stocks = [s for s in filtered_stocks if s.get('symbol') in min_price_symbols]
-            uti_ene_symbols = [s['symbol'] for s in filtered_stocks]
-
-    url_daily = "http://192.168.8.190:8000/MKD/stock-ratios-daily"
-    daily_params = {
-        "symbols": ",".join(uti_ene_symbols),
-        "codes": "30022",
-        "start_date": "2025-11-01",
-        "end_date": "2025-12-31"
-    }
-    r = requests.get(url_daily, params=daily_params, headers={"accept": "application/json"})
-    r.raise_for_status()
-    daily_payload = r.json()
-    if isinstance(daily_payload, dict):
-        daily_data = daily_payload.get('data', [])
-    else:
-        daily_data = daily_payload
-
-    matching_volume_sum = {}
-    matching_volume_count = {}
-    for record in daily_data:
-        if not isinstance(record, dict):
-            continue
-        if str(record.get('code')) != '30022':
-            continue
-        symbol = record.get('symbol')
-        value = record.get('value')
-        if symbol and value is not None:
-            matching_volume_sum[symbol] = matching_volume_sum.get(symbol, 0.0) + float(value)
-            matching_volume_count[symbol] = matching_volume_count.get(symbol, 0) + 1
-
-    matching_volume_12_2025 = {
-        symbol: matching_volume_sum[symbol] / matching_volume_count[symbol]
-        for symbol in matching_volume_sum
-        if matching_volume_count.get(symbol, 0) > 0
-    }
-
-    # Sort by average matching volume December 2025 and take top 100
-    filtered_stocks = sorted(
-        uti_ene_symbols,
-        key=lambda s: float(matching_volume_12_2025.get(s, float('-inf'))),
-        reverse=True
+    filtered_stocks = filter_stocks_by_price_and_liquidity(
+        filtered_stocks,
+        min_price=11000,
+        min_volume_threshold=20000,
+        min_pass_rate=0.50,
+        start_date=getattr(TechAna, 'START_DATE', None),
+        end_date=getattr(TechAna, 'END_DATE', None),
     )
-    top_50_stocks = filtered_stocks[:50]
-    uti_ene_symbols = top_50_stocks
+    uti_ene_symbols = [s['symbol'] for s in filtered_stocks]
 
     url = "http://192.168.8.190:8000/MKD/stock-ratios"
     params = {
@@ -140,6 +58,16 @@ try:
             if pd.notna(end_dt):
                 prev_q_end = (end_dt.to_period('Q') - 1).end_time
                 as_of_date = prev_q_end.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
+    # Guard against look-ahead bias by cutting fundamental data at as_of_date.
+    if as_of_date:
+        try:
+            as_of_ts = pd.to_datetime(as_of_date, errors="coerce")
+            if pd.notna(as_of_ts) and not df_ratios.empty and 'date' in df_ratios.columns:
+                ratio_dates = pd.to_datetime(df_ratios['date'], errors='coerce')
+                df_ratios = df_ratios[ratio_dates.notna() & (ratio_dates <= as_of_ts)].copy()
         except Exception:
             pass
 
@@ -889,7 +817,8 @@ for idx, (symbol, uti_ene_df) in enumerate(uti_ene_ratios_data.items()):
 
 # %%
 class RelativeValuationScorer:
-    def __init__(self):
+    def __init__(self, as_of_ts=None):
+        self.as_of_ts = as_of_ts
         self.criteria = [
             {'id': 1, 'name': 'EV/EBITDA', 'code': 'ryd30', 'type': 'peer_percentile', 'rule': 'pct <= 0.60', 'cut': 0.60, 'direction': 'lower', 'must_have': False},
             {'id': 2, 'name': 'P/B vs ROE valuation', 'type': 'ratio_vs_peer','numerator': 'ryd25', 'denominator': 'ryq12','rule': 'ratio <= peer_median', 'direction': 'lower', 'must_have': False},
@@ -899,14 +828,25 @@ class RelativeValuationScorer:
         ]
 
     def get_latest_value(self, df, code):
-        if df is None or df.empty: return None
-        if 'date' in df.columns:
-            series = df[df['code'] == code].sort_values('date')['value']
+        if df is None or df.empty:
+            return None
+
+        metric_df = df[df['code'] == code].copy()
+        if metric_df.empty:
+            return None
+
+        if 'date' in metric_df.columns:
+            metric_df['date'] = pd.to_datetime(metric_df['date'], errors='coerce')
+            metric_df = metric_df[metric_df['date'].notna()]
+            if self.as_of_ts is not None:
+                metric_df = metric_df[metric_df['date'] <= self.as_of_ts]
+            series = metric_df.sort_values('date')['value']
         else:
-            series = df[df['code'] == code]['value']
+            series = metric_df['value']
+
         return series.iloc[-1] if not series.empty else None
 
-    def evaluate_criterion(self, symbol, df, criterion, all_companies_data):
+    def evaluate_criterion(self, symbol, df, criterion, all_companies_data, peer_data_cache=None):
         try:
             crit_type = criterion['type']
 
@@ -973,13 +913,13 @@ class RelativeValuationScorer:
         except Exception as e:
             return {'pass': False, 'reason': str(e)}
 
-    def score(self, symbol, df, all_companies_data):
+    def score(self, symbol, df, all_companies_data, peer_data_cache=None):
         results = {}
         points = 0
         weight = 5.0 / len(self.criteria)
 
         for crit in self.criteria:
-            res = self.evaluate_criterion(symbol, df, crit, all_companies_data)
+            res = self.evaluate_criterion(symbol, df, crit, all_companies_data, peer_data_cache)
             results[f"C{crit['id']}"] = res
             if res['pass']:
                 points += weight
@@ -988,11 +928,11 @@ class RelativeValuationScorer:
 
 # %%
 try:
-    val_scorer = RelativeValuationScorer()
+    val_scorer = RelativeValuationScorer(as_of_ts=as_of_ts)
     val_scores = {}
 
     for symbol, uti_ene_df in uti_ene_ratios_data.items():
-        val_scores[symbol] = val_scorer.score(symbol, uti_ene_df, uti_ene_ratios_data)    
+        val_scores[symbol] = val_scorer.score(symbol, uti_ene_df, uti_ene_ratios_data, None)    
     
     # Build combined scores
     combined_scores_draft = pd.DataFrame({

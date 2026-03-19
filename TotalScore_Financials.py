@@ -50,9 +50,14 @@ def get_total_score(start_date, end_date, industry='Financials', year=None, quar
     # Use risk_scores from RiskControl_Fin
     stock_data = TechAna.APIFetcher.fetch_batch(
         "http://192.168.8.190:8000/MKD/stock_daily", 
-        symbols_to_analyze, START_DATE, END_DATE
+        symbols_to_analyze, start_date, end_date
     )
-    risk_records = RiskControl.calculate_risk_metrics_batch(symbols_to_analyze, stock_data)
+    risk_records = RiskControl.calculate_risk_metrics_batch(
+        symbols_to_analyze,
+        stock_data,
+        start_date,
+        end_date
+    )
     risk_scorer = RiskControl.RiskControlScorer()
     risk_scores = {}
     for rec in risk_records:
@@ -113,3 +118,4 @@ if __name__ == "__main__":
         print(display_df.to_string(index=False))
     else:
         print("No data validated for analysis.")
+# %%

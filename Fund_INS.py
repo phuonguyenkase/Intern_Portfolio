@@ -3,6 +3,10 @@ import requests
 import pandas as pd
 import os
 import TechAna_DRAFT as TechAna
+from Filtering_Stock import filter_stocks_by_price_and_liquidity
+
+START_DATE = TechAna.START_DATE
+END_DATE = TechAna.END_DATE
 
 all_stocks = []
 insurance_symbols = []
@@ -10,6 +14,7 @@ all_ratios_data = []
 df_ratios = pd.DataFrame()
 insurance_ratios_data = {}
 as_of_date = os.getenv("Fund_AsOf_Date")
+as_of_ts = None
 
 # Make exports safe even if fetch or scoring fails
 combined_scores_draft = pd.DataFrame()
@@ -19,12 +24,22 @@ try:
     r = requests.get("http://192.168.8.190:8000/MKD/stock_info")
     r.raise_for_status()
     all_stocks = r.json()
-    insurance_symbols = [s['symbol'] for s in all_stocks if s.get('industry_lv2') == 'Insurance']
+    filtered_stocks = [s for s in all_stocks if s.get('industry_lv2') == 'Insurance']
+    filtered_stocks = filter_stocks_by_price_and_liquidity(
+        filtered_stocks,
+        min_price=10000,
+        min_volume_threshold=20000,
+        min_pass_rate=0.50,
+        start_date=getattr(TechAna, 'START_DATE', None),
+        end_date=getattr(TechAna, 'END_DATE', None),
+    )
+    insurance_symbols = [s['symbol'] for s in filtered_stocks]
+
     url = "http://192.168.8.190:8000/MKD/stock-ratios"
     params = {
         "symbols": ",".join(insurance_symbols),
         "period": "quarterly",
-        "num_periods": 12,
+        "num_periods": 20,
         "language": "en"
     }
     r = requests.get(url, params=params, headers={"accept": "application/json"})
@@ -33,20 +48,6 @@ try:
 
     # Convert to DataFrame
     df_ratios = pd.DataFrame(all_ratios_data)
-
-    # Handle date columns - stock-ratios may use year/quarter instead of date
-    if 'date' in df_ratios.columns:
-        df_ratios['date'] = pd.to_datetime(df_ratios['date'], errors='coerce')
-    elif 'year' in df_ratios.columns and 'quarter' in df_ratios.columns:
-        # Create date from year and quarter (end of quarter)
-        quarter_months = {1: 3, 2: 6, 3: 9, 4: 12}
-        df_ratios['date'] = pd.to_datetime(
-            df_ratios.apply(
-                lambda row: f"{int(row['year'])}-{quarter_months.get(int(row['quarter']), 12)}-01",
-                axis=1
-            ),
-            errors='coerce'
-        )
     
     if not as_of_date:
         try:
@@ -54,6 +55,16 @@ try:
             if pd.notna(end_dt):
                 prev_q_end = (end_dt.to_period('Q') - 1).end_time
                 as_of_date = prev_q_end.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
+    # Guard against look-ahead bias by cutting fundamental data at as_of_date.
+    if as_of_date:
+        try:
+            as_of_ts = pd.to_datetime(as_of_date, errors="coerce")
+            if pd.notna(as_of_ts) and not df_ratios.empty and 'date' in df_ratios.columns:
+                ratio_dates = pd.to_datetime(df_ratios['date'], errors='coerce')
+                df_ratios = df_ratios[ratio_dates.notna() & (ratio_dates <= as_of_ts)].copy()
         except Exception:
             pass
 
@@ -175,7 +186,7 @@ class LiquidityScorer:
         
         return series
     
-    def evaluate_criterion(self, insurance_df, criterion, all_companies_data):
+    def evaluate_criterion(self, insurance_df, criterion, all_companies_data, peer_data_cache=None):
         """Evaluate a single criterion over the last 12 quarters"""
         try:
             crit_type = criterion['type']
@@ -235,21 +246,33 @@ class LiquidityScorer:
 
                 if crit_type == 'calculated_peer':
                     numerator, denominator = criterion['codes']
-                    peer_maps = [
-                        {
-                            p: v for p, v in self.calculate_ratio_series(df, numerator, denominator, periods=None)
-                        }
-                        for df in all_companies_data.values()
-                    ]
+                    cache_key = f"ratio:{numerator}/{denominator}"
+                    if peer_data_cache and cache_key in peer_data_cache:
+                        peer_maps = peer_data_cache[cache_key]
+                    else:
+                        peer_maps = [
+                            {
+                                p: v for p, v in self.calculate_ratio_series(df, numerator, denominator, periods=None)
+                            }
+                            for df in all_companies_data.values()
+                        ]
                 elif crit_type == 'calculated_peer_percentile':
-                    peer_maps = [
-                        {
-                            p: v for p, v in self.calculate_complex_formula_series(df, criterion['codes'], criterion['formula'], periods=None)
-                        }
-                        for df in all_companies_data.values()
-                    ]
+                    cache_key = f"formula:{criterion.get('formula', '')}"
+                    if peer_data_cache and cache_key in peer_data_cache:
+                        peer_maps = peer_data_cache[cache_key]
+                    else:
+                        peer_maps = [
+                            {
+                                p: v for p, v in self.calculate_complex_formula_series(df, criterion['codes'], criterion['formula'], periods=None)
+                            }
+                            for df in all_companies_data.values()
+                        ]
                 else:
-                    peer_maps = [self.get_metric_period_dict(df, criterion['code']) for df in all_companies_data.values()]
+                    code = criterion['code']
+                    if peer_data_cache and code in peer_data_cache:
+                        peer_maps = peer_data_cache[code]
+                    else:
+                        peer_maps = [self.get_metric_period_dict(df, code) for df in all_companies_data.values()]
 
                 period_passes = []
                 percentiles = []
@@ -287,7 +310,7 @@ class LiquidityScorer:
         except Exception as e:
             return {'pass': False, 'reason': str(e)}
     
-    def score_insurance(self, symbol, insurance_df, all_companies_data):
+    def score_insurance(self, symbol, insurance_df, all_companies_data, peer_data_cache=None):
         """Calculate liquidity score for a insurance (0-5 points)"""
         results = {}
         points = 0
@@ -297,7 +320,7 @@ class LiquidityScorer:
         must_have_results = []
         for crit in self.criteria:
             if crit['must_have']:
-                result = self.evaluate_criterion(insurance_df, crit, all_companies_data)
+                result = self.evaluate_criterion(insurance_df, crit, all_companies_data, peer_data_cache)
                 must_have_results.append(result['pass'])
                 results[f"C{crit['id']}"] = result
         
@@ -307,7 +330,7 @@ class LiquidityScorer:
         # Optional criteria (distribute remaining 3 points)
         optional_criteria = [c for c in self.criteria if not c['must_have']]
         for crit in optional_criteria:
-            result = self.evaluate_criterion(insurance_df, crit, all_companies_data)
+            result = self.evaluate_criterion(insurance_df, crit, all_companies_data, peer_data_cache)
             results[f"C{crit['id']}"] = result
             if result['pass']:
                 points += 3 / len(optional_criteria)  # Distribute 3 points among optional
@@ -366,7 +389,7 @@ class ProfitabilityScorer:
         metric_data = metric_data.dropna(subset=['value'])
         return dict(metric_data[['period_key', 'value']].itertuples(index=False, name=None))
 
-    def evaluate_criterion(self, insurance_df, criterion, all_companies_data):
+    def evaluate_criterion(self, insurance_df, criterion, all_companies_data, peer_data_cache=None):
         try:
             crit_type = criterion['type']
 
@@ -398,7 +421,11 @@ class ProfitabilityScorer:
                     return {'pass': False, 'reason': 'No period values available', 'values': []}
 
                 period_values = {p: v for p, v in series}
-                peer_maps = [self.get_metric_period_dict(df, criterion['code']) for df in all_companies_data.values()]
+                code = criterion['code']
+                if peer_data_cache and code in peer_data_cache:
+                    peer_maps = peer_data_cache[code]
+                else:
+                    peer_maps = [self.get_metric_period_dict(df, code) for df in all_companies_data.values()]
 
                 period_passes = []
                 percentiles = []
@@ -436,14 +463,14 @@ class ProfitabilityScorer:
         except Exception as e:
             return {'pass': False, 'reason': str(e)}
 
-    def score_insurance(self, symbol, insurance_df, all_companies_data):
+    def score_insurance(self, symbol, insurance_df, all_companies_data, peer_data_cache=None):
         results = {}
         points = 0
         
         must_have_results = []
         for crit in self.criteria:
             if crit['must_have']:
-                result = self.evaluate_criterion(insurance_df, crit, all_companies_data)
+                result = self.evaluate_criterion(insurance_df, crit, all_companies_data, peer_data_cache)
                 must_have_results.append(result['pass'])
                 results[f"C{crit['id']}"] = result
         
@@ -452,7 +479,7 @@ class ProfitabilityScorer:
         
         optional_criteria = [c for c in self.criteria if not c['must_have']]
         for crit in optional_criteria:
-            result = self.evaluate_criterion(insurance_df, crit, all_companies_data)
+            result = self.evaluate_criterion(insurance_df, crit, all_companies_data, peer_data_cache)
             results[f"C{crit['id']}"] = result
             if result['pass']:
                 points += 3 / len(optional_criteria)
@@ -467,16 +494,41 @@ class ProfitabilityScorer:
 scorer = LiquidityScorer()
 liq_scores = {}
 
+# Pre-calculate peer data cache for LiquidityScorer
+liq_peer_data_cache = {}
+# Simple metric codes
+for code in ['ryq2']:
+    liq_peer_data_cache[code] = [scorer.get_metric_period_dict(df, code) for df in insurance_ratios_data.values()]
+# Calculated ratio keys
+for ratio_key, num_code, denom_code in [
+    ('ratio:bsa2/bsa5', 'bsa2', 'bsa5'),
+    ('ratio:bsa2/bsa5', 'bsa2', 'bsa5'),  # For Immediate Liquidity (same formula)
+    ('ratio:bsa8/bsa53', 'bsa8', 'bsa53'),  # For Receivables Control
+    ('ratio:bsa78/bsa53', 'bsa78', 'bsa53'),  # For Capital Buffer
+]:
+    if ratio_key not in liq_peer_data_cache:
+        liq_peer_data_cache[ratio_key] = [
+            {
+                p: v for p, v in scorer.calculate_ratio_series(df, num_code, denom_code, periods=None)
+            }
+            for df in insurance_ratios_data.values()
+        ]
+
 for idx, (symbol, insurance_df) in enumerate(insurance_ratios_data.items()):
-    score_result = scorer.score_insurance(symbol, insurance_df, insurance_ratios_data)
+    score_result = scorer.score_insurance(symbol, insurance_df, insurance_ratios_data, liq_peer_data_cache)
     liq_scores[symbol] = score_result
 
 # %%
 prof_scorer = ProfitabilityScorer()
 prof_scores = {}
 
+# Pre-calculate peer data cache for ProfitabilityScorer
+prof_peer_data_cache = {}
+for code in ['ryq29', 'ryq12', 'ryq14', 'ryq39']:
+    prof_peer_data_cache[code] = [prof_scorer.get_metric_period_dict(df, code) for df in insurance_ratios_data.values()]
+
 for idx, (symbol, insurance_df) in enumerate(insurance_ratios_data.items()):
-    score_result = prof_scorer.score_insurance(symbol, insurance_df, insurance_ratios_data)
+    score_result = prof_scorer.score_insurance(symbol, insurance_df, insurance_ratios_data, prof_peer_data_cache)
     prof_scores[symbol] = score_result
 
 # %%
@@ -553,7 +605,7 @@ class SolvencyScorer:
 
         return series
 
-    def evaluate_criterion(self, insurance_df, criterion, all_companies_data):
+    def evaluate_criterion(self, insurance_df, criterion, all_companies_data, peer_data_cache=None):
         try:
             crit_type = criterion['type']
 
@@ -586,12 +638,17 @@ class SolvencyScorer:
                     return {'pass': False, 'reason': 'No period values available', 'values': []}
 
                 period_values = {p: v for p, v in series}
-                peer_maps = [
-                    {
-                        p: v for p, v in self.calculate_ratio_series(df, numerator, denominator, periods=None)
-                    }
-                    for df in all_companies_data.values()
-                ]
+                
+                cache_key = f"ratio:{numerator}/{denominator}"
+                if peer_data_cache and cache_key in peer_data_cache:
+                    peer_maps = peer_data_cache[cache_key]
+                else:
+                    peer_maps = [
+                        {
+                            p: v for p, v in self.calculate_ratio_series(df, numerator, denominator, periods=None)
+                        }
+                        for df in all_companies_data.values()
+                    ]
 
                 period_passes = []
                 percentiles = []
@@ -630,7 +687,11 @@ class SolvencyScorer:
                     return {'pass': False, 'reason': 'No period values available', 'values': []}
 
                 period_values = {p: v for p, v in series}
-                peer_maps = [self.get_metric_period_dict(df, criterion['code']) for df in all_companies_data.values()]
+                code = criterion['code']
+                if peer_data_cache and code in peer_data_cache:
+                    peer_maps = peer_data_cache[code]
+                else:
+                    peer_maps = [self.get_metric_period_dict(df, code) for df in all_companies_data.values()]
 
                 period_passes = []
                 percentiles = []
@@ -668,14 +729,14 @@ class SolvencyScorer:
         except Exception as e:
             return {'pass': False, 'reason': str(e)}
 
-    def score_insurance(self, symbol, insurance_df, all_companies_data):
+    def score_insurance(self, symbol, insurance_df, all_companies_data, peer_data_cache=None):
         results = {}
         points = 0
         
         must_have_results = []
         for crit in self.criteria:
             if crit['must_have']:
-                result = self.evaluate_criterion(insurance_df, crit, all_companies_data)
+                result = self.evaluate_criterion(insurance_df, crit, all_companies_data, peer_data_cache)
                 must_have_results.append(result['pass'])
                 results[f"C{crit['id']}"] = result
         
@@ -684,7 +745,7 @@ class SolvencyScorer:
         
         optional_criteria = [c for c in self.criteria if not c['must_have']]
         for crit in optional_criteria:
-            result = self.evaluate_criterion(insurance_df, crit, all_companies_data)
+            result = self.evaluate_criterion(insurance_df, crit, all_companies_data, peer_data_cache)
             results[f"C{crit['id']}"] = result
             if result['pass']:
                 points += 3 / len(optional_criteria)
@@ -699,8 +760,20 @@ class SolvencyScorer:
 solv_scorer = SolvencyScorer()
 solv_scores = {}
 
+# Pre-calculate peer data cache for SolvencyScorer
+solv_peer_data_cache = {}
+for code in ['ryq6', 'ryq71', 'ryq10']:
+    solv_peer_data_cache[code] = [solv_scorer.get_metric_period_dict(df, code) for df in insurance_ratios_data.values()]
+# Calculated ratio key
+solv_peer_data_cache['ratio:bsa78/bsa53'] = [
+    {
+        p: v for p, v in solv_scorer.calculate_ratio_series(df, 'bsa78', 'bsa53', periods=None)
+    }
+    for df in insurance_ratios_data.values()
+]
+
 for idx, (symbol, insurance_df) in enumerate(insurance_ratios_data.items()):
-    score_result = solv_scorer.score_insurance(symbol, insurance_df, insurance_ratios_data)
+    score_result = solv_scorer.score_insurance(symbol, insurance_df, insurance_ratios_data, solv_peer_data_cache)
     solv_scores[symbol] = score_result
 
 # %%
@@ -809,7 +882,7 @@ class RelativeValuationScorer:
         
         return series
 
-    def evaluate_criterion(self, insurance_df, criterion, all_companies_data):
+    def evaluate_criterion(self, insurance_df, criterion, all_companies_data, peer_data_cache=None):
         try:
             crit_type = criterion['type']
 
@@ -841,7 +914,11 @@ class RelativeValuationScorer:
                     return {'pass': False, 'reason': 'No period values available', 'values': []}
 
                 period_values = {p: v for p, v in series}
-                peer_maps = [self.get_metric_period_dict(df, criterion['code']) for df in all_companies_data.values()]
+                code = criterion['code']
+                if peer_data_cache and code in peer_data_cache:
+                    peer_maps = peer_data_cache[code]
+                else:
+                    peer_maps = [self.get_metric_period_dict(df, code) for df in all_companies_data.values()]
 
                 period_passes = []
                 percentiles = []
@@ -947,12 +1024,17 @@ class RelativeValuationScorer:
                     return {'pass': False, 'reason': 'No period values available', 'values': []}
 
                 period_values = {p: v for p, v in series}
-                peer_maps = [
-                    {
-                        p: v for p, v in self.calculate_ratio_series(df, numerator, denominator, periods=None)
-                    }
-                    for df in all_companies_data.values()
-                ]
+                
+                cache_key = f"ratio:{numerator}/{denominator}"
+                if peer_data_cache and cache_key in peer_data_cache:
+                    peer_maps = peer_data_cache[cache_key]
+                else:
+                    peer_maps = [
+                        {
+                            p: v for p, v in self.calculate_ratio_series(df, numerator, denominator, periods=None)
+                        }
+                        for df in all_companies_data.values()
+                    ]
 
                 period_passes = []
                 percentiles = []
@@ -990,14 +1072,14 @@ class RelativeValuationScorer:
         except Exception as e:
             return {'pass': False, 'reason': str(e)}
 
-    def score(self, symbol, insurance_df, all_companies_data):
+    def score(self, symbol, insurance_df, all_companies_data, peer_data_cache=None):
         results = {}
         points = 0
         
         must_have_results = []
         for crit in self.criteria:
             if crit['must_have']:
-                result = self.evaluate_criterion(insurance_df, crit, all_companies_data)
+                result = self.evaluate_criterion(insurance_df, crit, all_companies_data, peer_data_cache)
                 must_have_results.append(result['pass'])
                 results[f"C{crit['id']}"] = result
         
@@ -1006,7 +1088,7 @@ class RelativeValuationScorer:
         
         optional_criteria = [c for c in self.criteria if not c['must_have']]
         for crit in optional_criteria:
-            result = self.evaluate_criterion(insurance_df, crit, all_companies_data)
+            result = self.evaluate_criterion(insurance_df, crit, all_companies_data, peer_data_cache)
             results[f"C{crit['id']}"] = result
             if result['pass']:
                 points += 3 / len(optional_criteria)
@@ -1022,8 +1104,20 @@ try:
     val_scorer = RelativeValuationScorer()
     val_scores = {}
 
+    # Pre-calculate peer data cache for RelativeValuationScorer
+    val_peer_data_cache = {}
+    for code in ['ryd25', 'ryq12', 'ryd11', 'bsa78']:
+        val_peer_data_cache[code] = [val_scorer.get_metric_period_dict(df, code) for df in insurance_ratios_data.values()]
+    # Calculated ratio key
+    val_peer_data_cache['ratio:ryd11/bsa78'] = [
+        {
+            p: v for p, v in val_scorer.calculate_ratio_series(df, 'ryd11', 'bsa78', periods=None)
+        }
+        for df in insurance_ratios_data.values()
+    ]
+
     for symbol, insurance_df in insurance_ratios_data.items():
-        val_scores[symbol] = val_scorer.score(symbol, insurance_df, insurance_ratios_data)    
+        val_scores[symbol] = val_scorer.score(symbol, insurance_df, insurance_ratios_data, val_peer_data_cache)    
     
     # Build combined scores (align symbols across all scorers)
     symbols = sorted(set(liq_scores.keys()) | set(prof_scores.keys()) | set(solv_scores.keys()) | set(val_scores.keys()))

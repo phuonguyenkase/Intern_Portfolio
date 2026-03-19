@@ -5,8 +5,8 @@ import numpy as np
 from scipy.stats import linregress
 from Bluechip import get_cached_bluechips
 
-START_DATE = "2022-01-01"
-END_DATE = "2022-03-31"
+START_DATE = "2025-10-01"
+END_DATE = "2025-12-31"
 
 class APIFetcher:
     @staticmethod
@@ -45,6 +45,10 @@ class APIFetcher:
                     if date_col in df.columns:
                         df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
                         df = df.sort_values(date_col).set_index(date_col)
+                        
+                        start_dt = pd.to_datetime(start_date)
+                        end_dt = pd.to_datetime(end_date)
+                        df = df[(df.index >= start_dt) & (df.index <= end_dt)]
                         break
                 result[symbol] = df
             except Exception:
@@ -151,20 +155,25 @@ def calculate_trend_strength(df, symbol=None):
 
 
 class TechnicalAnalysisScorer:
-    def __init__(self, linreg_window=57):
-        self.linreg_window = linreg_window
+    def __init__(self, timeframes=None):
+        if timeframes is None:
+            self.timeframes = {20: 0.3, 57: 0.7}
+        else:
+            self.timeframes = timeframes
+        self.max_window = max(self.timeframes.keys())
+        self.linreg_window = self.max_window
 
-    def _compute_linreg_metrics(self, tech_df):
-        if tech_df is None or len(tech_df) < self.linreg_window:
+    def _compute_linreg_metrics(self, tech_df, window):
+        if tech_df is None or len(tech_df) < window:
             return None
 
         close = pd.to_numeric(tech_df['close'], errors='coerce').dropna()
-        close_60 = close.tail(self.linreg_window)
-        if len(close_60) < self.linreg_window:
+        close_window = close.tail(window)
+        if len(close_window) < window:
             return None
 
-        x = np.arange(self.linreg_window, dtype=float)
-        y = close_60.values.astype(float)
+        x = np.arange(window, dtype=float)
+        y = close_window.values.astype(float)
 
         lr = linregress(x, y)
         slope = lr.slope
@@ -195,9 +204,9 @@ class TechnicalAnalysisScorer:
         vol_corr = np.nan
         if 'volume' in tech_df.columns:
             vol = pd.to_numeric(tech_df['volume'], errors='coerce').dropna()
-            vol_60 = vol.tail(self.linreg_window)
-            if len(vol_60) == self.linreg_window:
-                vol_corr = close_60.corr(vol_60)
+            vol_window = vol.tail(window)
+            if len(vol_window) == window:
+                vol_corr = close_window.corr(vol_window)
 
         return {
             'slope': slope,
@@ -213,96 +222,169 @@ class TechnicalAnalysisScorer:
         if tech_df is None or len(tech_df) < self.linreg_window:
             return {'symbol': symbol, 'score': 0, 'trend_strength': 0}
 
-        metrics = self._compute_linreg_metrics(tech_df)
-        if metrics is None:
-            return {'symbol': symbol, 'score': 0, 'trend_strength': 0}
+        p4_score = 0.5
+        rs_return = np.nan
+        p4_details = {}
+        
+        if vni_series is not None and len(tech_df) >= 10:
+            try:
+                stock_close_10d = tech_df['close'].iloc[-10:]
+                vni_10d = vni_series.reindex(stock_close_10d.index)
+                valid_mask = stock_close_10d.notna() & vni_10d.notna()
+                
+                if valid_mask.sum() >= 5:
+                    rs_line = stock_close_10d[valid_mask] / vni_10d[valid_mask]
+                    
+                    rs_return = (rs_line.iloc[-1] / rs_line.iloc[0]) - 1
+                    
+                    p4_score = (np.tanh(rs_return * 15) + 1) / 2
+                    p4_details = {
+                        'rs_return_pct': round(rs_return * 100, 2),
+                        'valid_days': int(valid_mask.sum())
+                    }
+            except Exception:
+                p4_details = {'error': 'P4 calculation failed'}
 
         latest = tech_df.iloc[-1]
         rsi = latest.get('rsi14', np.nan)
 
-        slope = metrics['slope']
-        r_squared = metrics['r_squared']
-        z_score = metrics['z_score']
-        vol_corr = metrics['vol_corr']
-        slope_pct = metrics.get('slope_pct', np.nan)
-        t_stat = metrics.get('t_stat', np.nan)
-
         def _clamp01(x):
             return max(0.0, min(1.0, x))
 
-        details = {}
+        def _score_from_metrics(metrics):
+            slope = metrics['slope']
+            r_squared = metrics['r_squared']
+            z_score = metrics['z_score']
+            vol_corr = metrics['vol_corr']
+            slope_pct = metrics.get('slope_pct', np.nan)
+            t_stat = metrics.get('t_stat', np.nan)
 
-        # Pillar 1: Trend Quality (continuous score, use %slope + t-stat)
-        slope_gain = 800.0
-        if pd.notna(slope_pct):
-            slope_score = (np.tanh(slope_pct * slope_gain) + 1) / 2  # 0..1
-        else:
-            slope_score = 0.5
+            slope_gain = 800.0
+            if pd.notna(slope_pct):
+                slope_score = (np.tanh(slope_pct * slope_gain) + 1) / 2
+            else:
+                slope_score = 0.5
 
-        if pd.notna(t_stat):
-            t_score = (np.tanh(t_stat / 2.0) + 1) / 2
-        else:
-            t_score = 0.5
+            if pd.notna(t_stat):
+                t_score = (np.tanh(t_stat / 2.0) + 1) / 2
+            else:
+                t_score = 0.5
 
-        p1_score = 0.55 * slope_score + 0.45 * t_score
-        details['P1'] = {
-            'score': round(p1_score * 5, 3),
-            'slope': slope,
-            'slope_pct': slope_pct,
-            't_stat': t_stat,
-            'r_squared': r_squared
+            p1_score = 0.55 * slope_score + 0.45 * t_score
+
+            z_score_val = z_score if pd.notna(z_score) else 0.0
+            z_score_norm = (np.tanh(-z_score_val / 1.5) + 1) / 2
+            if pd.notna(rsi):
+                rsi_score = _clamp01((80 - rsi) / 50)
+            else:
+                rsi_score = 0.5
+            p2_score = 0.6 * z_score_norm + 0.4 * rsi_score
+
+            if pd.notna(vol_corr):
+                p3_score = (np.tanh(vol_corr * 3) + 1) / 2
+            else:
+                p3_score = 0.5
+
+            base_trend_score = (0.65 * p1_score + 0.35 * p3_score) * 5
+            risk_filter = 0.2 + 0.8 * p2_score
+            total_score = base_trend_score * risk_filter
+            final_score = _clamp01(total_score / 5) * 5
+
+            trend_strength = 0.0
+            if pd.notna(r_squared):
+                trend_strength = np.tanh(slope) * max(min(r_squared, 1.0), 0.0)
+
+            return {
+                'score': final_score,
+                'base_score': total_score,
+                'trend_strength': trend_strength,
+                'trend_metrics': {
+                    'slope': slope,
+                    'r_squared': r_squared,
+                    'z_score': z_score,
+                    'rsi': rsi,
+                    'vol_corr': vol_corr,
+                    'slope_pct': slope_pct,
+                    't_stat': t_stat
+                },
+                'details': {
+                    'P1': {
+                        'score': round(p1_score * 5, 3),
+                        'slope': slope,
+                        'slope_pct': slope_pct,
+                        't_stat': t_stat,
+                        'r_squared': r_squared
+                    },
+                    'P2': {
+                        'score': round(p2_score * 5, 3),
+                        'z_score': z_score,
+                        'rsi': rsi
+                    },
+                    'P3': {
+                        'score': round(p3_score * 5, 3),
+                        'vol_corr': vol_corr
+                    }
+                }
+            }
+
+        per_window = {}
+        for window in sorted(self.timeframes.keys()):
+            metrics = self._compute_linreg_metrics(tech_df, window)
+            if metrics is None:
+                return {'symbol': symbol, 'score': 0, 'trend_strength': 0}
+            per_window[window] = _score_from_metrics(metrics)
+
+        weighted_score = 0.0
+        weighted_base_score = 0.0
+        weighted_trend_strength = 0.0
+        weighted_trend_metrics = {
+            'slope': 0.0,
+            'r_squared': 0.0,
+            'z_score': 0.0,
+            'rsi': 0.0,
+            'vol_corr': 0.0,
+            'slope_pct': 0.0,
+            't_stat': 0.0
+        }
+        weighted_details = {'P1': 0.0, 'P2': 0.0, 'P3': 0.0}
+
+        for window, weight in self.timeframes.items():
+            result = per_window[window]
+            weighted_score += result['score'] * weight
+            weighted_base_score += result['base_score'] * weight
+            weighted_trend_strength += result['trend_strength'] * weight
+
+            tm = result['trend_metrics']
+            for k in weighted_trend_metrics:
+                val = tm.get(k, np.nan)
+                weighted_trend_metrics[k] += (float(val) if pd.notna(val) else 0.0) * weight
+
+            weighted_details['P1'] += result['details']['P1']['score'] * weight
+            weighted_details['P2'] += result['details']['P2']['score'] * weight
+            weighted_details['P3'] += result['details']['P3']['score'] * weight
+
+        details = {
+            'P1': {'score': round(weighted_details['P1'], 3)},
+            'P2': {'score': round(weighted_details['P2'], 3)},
+            'P3': {'score': round(weighted_details['P3'], 3)},
+            'P4': {
+                'score': round(p4_score * 5, 3),
+                'normalized_score': round(p4_score, 3),
+                **p4_details
+            },
+            'timeframes': {window: {'weight': self.timeframes[window], 'score': round(per_window[window]['score'], 3)} for window in sorted(self.timeframes.keys())}
         }
 
-        # Pillar 2: Mean Reversion Risk (continuous score, lower z/rsi is better)
-        z_score_val = z_score if pd.notna(z_score) else 0.0
-        z_score_norm = (np.tanh(-z_score_val / 1.5) + 1) / 2  # 0..1
-        if pd.notna(rsi):
-            rsi_score = _clamp01((80 - rsi) / 50)  # rsi 30->1, 80->0
-        else:
-            rsi_score = 0.5
-        p2_score = 0.6 * z_score_norm + 0.4 * rsi_score
-        details['P2'] = {
-            'score': round(p2_score * 5, 3),
-            'z_score': z_score,
-            'rsi': rsi
-        }
-
-        # Pillar 3: Money Flow Validation (continuous score)
-        if pd.notna(vol_corr):
-            vol_score = (np.tanh(vol_corr * 3) + 1) / 2
-        else:
-            vol_score = 0.5
-        p3_score = vol_score
-        details['P3'] = {
-            'score': round(p3_score * 5, 3),
-            'vol_corr': vol_corr
-        }
-
-        # Base trend score (P1 + P3) then apply risk as a multiplicative filter (P2)
-        base_trend_score = (0.65 * p1_score + 0.35 * p3_score) * 5
-        risk_filter = 0.2 + 0.8 * p2_score
-        total_score = base_trend_score * risk_filter
-
-        trend_strength = 0.0
-        if pd.notna(r_squared):
-            trend_strength = np.tanh(slope) * max(min(r_squared, 1.0), 0.0)
-
-        final_score = _clamp01(total_score / 5) * 5
+        final_score = (weighted_score * 0.75) + (p4_score * 5 * 0.25)
 
         return {
             'symbol': symbol,
             'score': round(final_score, 3),
-            'base_score': round(total_score, 3),
-            'trend_strength': trend_strength,
-            'trend_metrics': {
-                'slope': slope,
-                'r_squared': r_squared,
-                'z_score': z_score,
-                'rsi': rsi,
-                'vol_corr': vol_corr,
-                'slope_pct': slope_pct,
-                't_stat': t_stat
-            },
+            'weighted_score': round(weighted_score, 3),
+            'p4_score': round(p4_score * 5, 3),
+            'base_score': round(weighted_base_score, 3),
+            'trend_strength': weighted_trend_strength,
+            'trend_metrics': weighted_trend_metrics,
             'details': details
         }
 
@@ -615,13 +697,18 @@ def calculate_drawdown_3m(df):
     return metrics.get('dd_3m')
 
 
-def calculate_risk_metrics_batch(symbol_list, stock_data):
+def calculate_risk_metrics_batch(symbol_list, stock_data, start_date=None, end_date=None):
     records = []
 
     # Attempt to fetch beta metrics in one call
     beta_map = {}
     try:
-        resp = requests.get("http://192.168.8.190:8000/MKD/beta_calculation", timeout=60)
+        beta_params = {}
+        if start_date:
+            beta_params['start_date'] = start_date
+        if end_date:
+            beta_params['end_date'] = end_date
+        resp = requests.get("http://192.168.8.190:8000/MKD/beta_calculation", params=beta_params if beta_params else None, timeout=60)
         if resp.status_code == 200:
             beta_json = resp.json()
             df_beta = pd.DataFrame(beta_json if isinstance(beta_json, list) else [beta_json])
@@ -707,7 +794,7 @@ def analyze_symbols(symbol_list, start_date, end_date, industry='Real Estate', y
 
     # 5. Risk Scoring
     risk_scorer = RiskControlScorer()
-    risk_records = calculate_risk_metrics_batch(symbol_list, stock_data)
+    risk_records = calculate_risk_metrics_batch(symbol_list, stock_data, start_date, end_date)
     risk_map = {r['symbol']: r for r in risk_records}
     
     risk_scores = {}

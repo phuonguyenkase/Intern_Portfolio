@@ -3,6 +3,10 @@ import requests
 import pandas as pd
 import os
 import TechAna_DRAFT as TechAna
+from Filtering_Stock import filter_stocks_by_price_and_liquidity
+
+START_DATE = TechAna.START_DATE
+END_DATE = TechAna.END_DATE
 
 all_stocks = []
 tech_tele_symbols = []
@@ -10,6 +14,7 @@ all_ratios_data = []
 df_ratios = pd.DataFrame()
 tech_tele_ratios_data = {}
 as_of_date = os.getenv("Fund_AsOf_Date")
+as_of_ts = None
 
 # Make exports safe even if fetch or scoring fails
 combined_scores_draft = pd.DataFrame()
@@ -19,61 +24,22 @@ try:
     r = requests.get("http://192.168.8.190:8000/MKD/stock_info")
     r.raise_for_status()
     all_stocks = r.json()
-    tech_tele_symbols = [s['symbol'] for s in all_stocks if s.get('industry_lv1') in ['Technology', 'Telecommunications']]
+    filtered_stocks = [s for s in all_stocks if s.get('industry_lv1') in ['Technology', 'Telecommunications']]
+    filtered_stocks = filter_stocks_by_price_and_liquidity(
+        filtered_stocks,
+        min_price=10000,
+        min_volume_threshold=20000,
+        min_pass_rate=0.50,
+        start_date=getattr(TechAna, 'START_DATE', None),
+        end_date=getattr(TechAna, 'END_DATE', None),
+    )
+    tech_tele_symbols = [s['symbol'] for s in filtered_stocks]
 
-    min_price = 10000
-    price_date = getattr(TechAna, 'END_DATE', None)
-    if price_date and tech_tele_symbols:
-        price_params = {
-            "symbols": ",".join(tech_tele_symbols),
-            "start_date": price_date,
-            "end_date": price_date
-        }
-        r = requests.get(
-            "http://192.168.8.190:8000/MKD/stock_daily",
-            params=price_params,
-            headers={"accept": "application/json"},
-            timeout=30
-        )
-        r.raise_for_status()
-        price_payload = r.json()
-        price_items = []
-        if isinstance(price_payload, dict):
-            for sym, rows in price_payload.items():
-                if isinstance(rows, list):
-                    for row in rows:
-                        if isinstance(row, dict):
-                            row = {**row, "symbol": row.get("symbol", sym)}
-                            price_items.append(row)
-                elif isinstance(rows, dict):
-                    row = {**rows, "symbol": rows.get("symbol", sym)}
-                    price_items.append(row)
-        elif isinstance(price_payload, list):
-            price_items = price_payload
-
-        price_map = {}
-        for row in price_items:
-            if not isinstance(row, dict):
-                continue
-            sym = row.get('symbol')
-            if not sym:
-                continue
-            price = row.get('adj_close')
-            if price is None:
-                continue
-            try:
-                price_map[sym] = float(price)
-            except (TypeError, ValueError):
-                continue
-
-        if price_map:
-            min_price_symbols = {s for s, v in price_map.items() if v >= min_price}
-            tech_tele_symbols = [s for s in tech_tele_symbols if s in min_price_symbols]
     url = "http://192.168.8.190:8000/MKD/stock-ratios"
     params = {
         "symbols": ",".join(tech_tele_symbols),
         "period": "quarterly",
-        "num_periods": 12,
+        "num_periods": 20,
         "language": "en"
     }
     r = requests.get(url, params=params, headers={"accept": "application/json"})
@@ -82,20 +48,6 @@ try:
 
     # Convert to DataFrame
     df_ratios = pd.DataFrame(all_ratios_data)
-
-    # Handle date columns - stock-ratios may use year/quarter instead of date
-    if 'date' in df_ratios.columns:
-        df_ratios['date'] = pd.to_datetime(df_ratios['date'], errors='coerce')
-    elif 'year' in df_ratios.columns and 'quarter' in df_ratios.columns:
-        # Create date from year and quarter (end of quarter)
-        quarter_months = {1: 3, 2: 6, 3: 9, 4: 12}
-        df_ratios['date'] = pd.to_datetime(
-            df_ratios.apply(
-                lambda row: f"{int(row['year'])}-{quarter_months.get(int(row['quarter']), 12)}-01",
-                axis=1
-            ),
-            errors='coerce'
-        )
     
     if not as_of_date:
         try:
@@ -103,6 +55,16 @@ try:
             if pd.notna(end_dt):
                 prev_q_end = (end_dt.to_period('Q') - 1).end_time
                 as_of_date = prev_q_end.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
+    # Guard against look-ahead bias by cutting fundamental data at as_of_date.
+    if as_of_date:
+        try:
+            as_of_ts = pd.to_datetime(as_of_date, errors="coerce")
+            if pd.notna(as_of_ts) and not df_ratios.empty and 'date' in df_ratios.columns:
+                ratio_dates = pd.to_datetime(df_ratios['date'], errors='coerce')
+                df_ratios = df_ratios[ratio_dates.notna() & (ratio_dates <= as_of_ts)].copy()
         except Exception:
             pass
 
@@ -860,7 +822,7 @@ class RelativeValuationScorer:
             
         return series.iloc[-1] if not series.empty else None
 
-    def evaluate_criterion(self, symbol, tech_tele_df, criterion, all_companies_data):
+    def evaluate_criterion(self, symbol, tech_tele_df, criterion, all_companies_data, peer_data_cache=None):
         try:
             crit_type = criterion['type']
 
@@ -868,10 +830,15 @@ class RelativeValuationScorer:
                 val = self.get_latest_value(tech_tele_df, criterion['code'])
                 if val is None: return {'pass': False, 'reason': 'Missing data'}
 
-                peer_vals = []
-                for df in all_companies_data.values():
-                    v = self.get_latest_value(df, criterion['code'])
-                    if v is not None: peer_vals.append(v)
+                # Use pre-computed peer_data_cache if available
+                code = criterion['code']
+                if peer_data_cache and code in peer_data_cache:
+                    peer_vals = peer_data_cache[code]
+                else:
+                    peer_vals = []
+                    for df in all_companies_data.values():
+                        v = self.get_latest_value(df, code)
+                        if v is not None: peer_vals.append(v)
                 
                 if not peer_vals: return {'pass': False}
                 
@@ -926,10 +893,15 @@ class RelativeValuationScorer:
                 my_val = calc_formula(tech_tele_df)
                 if my_val is None: return {'pass': False, 'reason': 'Calc Error'}
                 
-                peer_vals = []
-                for df in all_companies_data.values():
-                    pv = calc_formula(df)
-                    if pv is not None: peer_vals.append(pv)
+                # Use pre-computed peer_data_cache if available
+                cache_key = 'calculated_peer_3'
+                if peer_data_cache and cache_key in peer_data_cache:
+                    peer_vals = peer_data_cache[cache_key]
+                else:
+                    peer_vals = []
+                    for df in all_companies_data.values():
+                        pv = calc_formula(df)
+                        if pv is not None: peer_vals.append(pv)
                 
                 if not peer_vals: return {'pass': False}
                 
@@ -943,37 +915,61 @@ class RelativeValuationScorer:
         except Exception as e:
             return {'pass': False, 'reason': str(e)}
 
-    def score(self, symbol, tech_tele_df, all_companies_data):
+    def score(self, symbol, tech_tele_df, all_companies_data, peer_data_cache=None):
         results = {}
         points = 0
         weight = 5.0 / 4 
 
         for crit in self.criteria:
-            res = self.evaluate_criterion(symbol, tech_tele_df, crit, all_companies_data)
+            res = self.evaluate_criterion(symbol, tech_tele_df, crit, all_companies_data, peer_data_cache)
             results[f"C{crit['id']}"] = res
             if res['pass']:
                 points += weight
         
         return {'symbol': symbol, 'score': round(points, 2), 'details': results}
     
-    def score_tech_tele(self, symbol, tech_tele_df, all_companies_data):
-        return self.score(symbol, tech_tele_df, all_companies_data)
+    def score_tech_tele(self, symbol, tech_tele_df, all_companies_data, peer_data_cache=None):
+        return self.score(symbol, tech_tele_df, all_companies_data, peer_data_cache)
 
 # %%
 try:
     val_scorer = RelativeValuationScorer()
+    
+    # Setup peer_data_cache for RelativeValuationScorer
+    val_peer_data_cache = {}
+    val_metric_codes = ['ryd30']  # EV/EBITDA
+    for code in val_metric_codes:
+        val_peer_data_cache[code] = [val_scorer.get_latest_value(df, code) for df in tech_tele_ratios_data.values()]
+    
+    # Pre-compute calculated_peer ratios
+    def calc_formula(df_input):
+        c = {}
+        for key, code in [('mkt_cap', 'ryd11'), ('gross_margin', 'ryq25'), ('rev', 'rev')]:
+            v = val_scorer.get_latest_value(df_input, code)
+            if v is None: return None
+            c[key] = v
+        if c['gross_margin'] == 0: return None
+        return c['mkt_cap'] / (c['gross_margin'] * c['rev'])
+    
+    peer_vals_cp3 = []
+    for df in tech_tele_ratios_data.values():
+        pv = calc_formula(df)
+        if pv is not None: peer_vals_cp3.append(pv)
+    val_peer_data_cache['calculated_peer_3'] = peer_vals_cp3
+    
     val_scores = {}
 
     for symbol, tech_tele_df in tech_tele_ratios_data.items():
-        val_scores[symbol] = val_scorer.score_tech_tele(symbol, tech_tele_df, tech_tele_ratios_data)    
+        val_scores[symbol] = val_scorer.score_tech_tele(symbol, tech_tele_df, tech_tele_ratios_data, val_peer_data_cache)    
     
-    # Build combined scores
+    # Build combined scores (align symbols across all scorers)
+    symbols = sorted(set(liq_scores.keys()) | set(prof_scores.keys()) | set(solv_scores.keys()) | set(val_scores.keys()))
     combined_scores_draft = pd.DataFrame({
-        'Symbol': sorted(liq_scores.keys()),
-        'LIQ_Score': [liq_scores[s]['score'] for s in sorted(liq_scores.keys())],
-        'PROF_Score': [prof_scores[s]['score'] for s in sorted(prof_scores.keys())],
-        'SOLV_Score': [solv_scores[s]['score'] for s in sorted(solv_scores.keys())],
-        'VAL_Score': [val_scores[s]['score'] for s in sorted(val_scores.keys())]
+        'Symbol': symbols,
+        'LIQ_Score': [liq_scores.get(s, {}).get('score', 0) for s in symbols],
+        'PROF_Score': [prof_scores.get(s, {}).get('score', 0) for s in symbols],
+        'SOLV_Score': [solv_scores.get(s, {}).get('score', 0) for s in symbols],
+        'VAL_Score': [val_scores.get(s, {}).get('score', 0) for s in symbols]
     })
     combined_scores_draft['Total_Score'] = combined_scores_draft['LIQ_Score'] + combined_scores_draft['PROF_Score'] + combined_scores_draft['SOLV_Score'] + combined_scores_draft['VAL_Score']
     combined_scores_draft = combined_scores_draft.sort_values('Total_Score', ascending=False).reset_index(drop=True)
@@ -985,4 +981,3 @@ except Exception as e:
     import traceback
     traceback.print_exc()
     combined_scores_draft = pd.DataFrame()
-# %%

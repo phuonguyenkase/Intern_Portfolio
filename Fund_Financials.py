@@ -3,6 +3,10 @@ import requests
 import pandas as pd
 import os
 import TechAna_DRAFT as TechAna
+from Filtering_Stock import filter_stocks_by_price_and_liquidity
+
+START_DATE = TechAna.START_DATE
+END_DATE = TechAna.END_DATE
 
 all_stocks = []
 financials_symbols = []
@@ -10,6 +14,7 @@ all_ratios_data = []
 df_ratios = pd.DataFrame()
 financials_ratios_data = {}
 as_of_date = os.getenv("Fund_AsOf_Date")
+as_of_ts = None
 
 # Make exports safe even if fetch or scoring fails
 combined_scores_draft = pd.DataFrame()
@@ -19,58 +24,21 @@ try:
     r = requests.get("http://192.168.8.190:8000/MKD/stock_info")
     r.raise_for_status()
     all_stocks = r.json()
-    financials_symbols = [s['symbol'] for s in all_stocks if s.get('industry_lv1') == 'Financials' and s.get('industry_lv2')=='Financial Services']
 
-    min_price = 10000
-    price_date = getattr(TechAna, 'END_DATE', None)
-    if price_date and financials_symbols:
-        price_params = {
-            "symbols": ",".join(financials_symbols),
-            "start_date": price_date,
-            "end_date": price_date
-        }
-        r = requests.get(
-            "http://192.168.8.190:8000/MKD/stock_daily",
-            params=price_params,
-            headers={"accept": "application/json"},
-            timeout=30
-        )
-        r.raise_for_status()
-        price_payload = r.json()
-        price_items = []
-        if isinstance(price_payload, dict):
-            for sym, rows in price_payload.items():
-                if isinstance(rows, list):
-                    for row in rows:
-                        if isinstance(row, dict):
-                            row = {**row, "symbol": row.get("symbol", sym)}
-                            price_items.append(row)
-                elif isinstance(rows, dict):
-                    row = {**rows, "symbol": rows.get("symbol", sym)}
-                    price_items.append(row)
-        elif isinstance(price_payload, list):
-            price_items = price_payload
+    filtered_stocks = [
+        s for s in all_stocks
+        if s.get('industry_lv1') == 'Financials' and s.get('industry_lv2') == 'Financial Services'
+    ]
+    filtered_stocks = filter_stocks_by_price_and_liquidity(
+        filtered_stocks,
+        min_price=10000,
+        min_volume_threshold=20000,
+        min_pass_rate=0.50,
+        start_date=getattr(TechAna, 'START_DATE', None),
+        end_date=getattr(TechAna, 'END_DATE', None),
+    )
+    financials_symbols = [s['symbol'] for s in filtered_stocks]
 
-        price_map = {}
-        for row in price_items:
-            if not isinstance(row, dict):
-                continue
-            sym = row.get('symbol')
-            if not sym:
-                continue
-            price = row.get('adj_close')
-            if price is None:
-                price = row.get('close')
-            if price is None:
-                continue
-            try:
-                price_map[sym] = float(price)
-            except (TypeError, ValueError):
-                continue
-
-        if price_map:
-            min_price_symbols = {s for s, v in price_map.items() if v >= min_price}
-            financials_symbols = [s for s in financials_symbols if s in min_price_symbols]
     url = "http://192.168.8.190:8000/MKD/stock-ratios"
     params = {
         "symbols": ",".join(financials_symbols),
@@ -82,22 +50,7 @@ try:
     r.raise_for_status()
     all_ratios_data.extend(r.json())
 
-    # Convert to DataFrame
     df_ratios = pd.DataFrame(all_ratios_data)
-
-    # Handle date columns - stock-ratios may use year/quarter instead of date
-    if 'date' in df_ratios.columns:
-        df_ratios['date'] = pd.to_datetime(df_ratios['date'], errors='coerce')
-    elif 'year' in df_ratios.columns and 'quarter' in df_ratios.columns:
-        # Create date from year and quarter (end of quarter)
-        quarter_months = {1: 3, 2: 6, 3: 9, 4: 12}
-        df_ratios['date'] = pd.to_datetime(
-            df_ratios.apply(
-                lambda row: f"{int(row['year'])}-{quarter_months.get(int(row['quarter']), 12)}-01",
-                axis=1
-            ),
-            errors='coerce'
-        )
 
     if not as_of_date:
         try:
@@ -108,20 +61,24 @@ try:
         except Exception:
             pass
 
-    # Organize by financials (sorted by date/year-quarter)
-    if 'symbol' in df_ratios.columns:
-        for symbol in sorted(df_ratios['symbol'].unique()):
-            df_sym = df_ratios[df_ratios['symbol'] == symbol].copy()
-            if 'date' in df_sym.columns:
-                df_sym = df_sym.sort_values('date')
-            elif 'year' in df_sym.columns and 'quarter' in df_sym.columns:
-                df_sym = df_sym.sort_values(['year', 'quarter'])
-            financials_ratios_data[symbol] = df_sym
+    # Guard against look-ahead bias by cutting fundamental data at as_of_date.
+    if as_of_date:
+        try:
+            as_of_ts = pd.to_datetime(as_of_date, errors="coerce")
+            if pd.notna(as_of_ts) and not df_ratios.empty and 'date' in df_ratios.columns:
+                ratio_dates = pd.to_datetime(df_ratios['date'], errors='coerce')
+                df_ratios = df_ratios[ratio_dates.notna() & (ratio_dates <= as_of_ts)].copy()
+        except Exception:
+            pass
 
+    if 'symbol' in df_ratios.columns:
+        df_filtered = df_ratios[df_ratios['symbol'].isin(financials_symbols)]
+        for symbol, symbol_data in df_filtered.groupby('symbol'):
+            financials_ratios_data[symbol] = symbol_data.copy()
 except Exception as e:
     # Keep importable even if API is down
-    print(f"[Fund_FINANCIALS] Warning: failed to fetch financials ratios: {e}")
-
+    print(f"[Fund_Financials] Warning: failed to fetch financials ratios: {e}")
+    
 # %%
 class LiquidityScorer:
     def __init__(self):
@@ -173,7 +130,7 @@ class LiquidityScorer:
         metric_data = metric_data.dropna(subset=['value'])
         return dict(metric_data[['period_key', 'value']].itertuples(index=False, name=None))
     
-    def evaluate_criterion(self, financial_df, criterion, all_financials_data):
+    def evaluate_criterion(self, financial_df, criterion, all_financials_data, peer_data_cache=None):
         """Evaluate a single criterion over the last 12 quarters (with pass rate ≥ 50%)"""
         try:
             crit_type = criterion['type']
@@ -206,7 +163,11 @@ class LiquidityScorer:
                     return {'pass': False, 'reason': 'No period values available', 'values': []}
 
                 period_values = {p: v for p, v in series}
-                peer_maps = [self.get_metric_period_dict(df, criterion['code']) for df in all_financials_data.values()]
+                code = criterion['code']
+                if peer_data_cache and code in peer_data_cache:
+                    peer_maps = peer_data_cache[code]
+                else:
+                    peer_maps = [self.get_metric_period_dict(df, code) for df in all_financials_data.values()]
 
                 period_passes = []
                 percentiles = []
@@ -244,7 +205,7 @@ class LiquidityScorer:
         except Exception as e:
             return {'pass': False, 'reason': str(e)}
     
-    def score_financial(self, symbol, financial_df, all_financials_data):
+    def score_financial(self, symbol, financial_df, all_financials_data, peer_data_cache=None):
         """Calculate liquidity score for a financial (0-5 points)"""
         results = {}
         points = 0
@@ -253,7 +214,7 @@ class LiquidityScorer:
         must_have_results = []
         for crit in self.criteria:
             if crit['must_have']:
-                result = self.evaluate_criterion(financial_df, crit, all_financials_data)
+                result = self.evaluate_criterion(financial_df, crit, all_financials_data, peer_data_cache)
                 must_have_results.append(result['pass'])
                 results[f"C{crit['id']}"] = result
         
@@ -263,7 +224,7 @@ class LiquidityScorer:
         # Optional criteria (distribute remaining 3 points)
         optional_criteria = [c for c in self.criteria if not c['must_have']]
         for crit in optional_criteria:
-            result = self.evaluate_criterion(financial_df, crit, all_financials_data)
+            result = self.evaluate_criterion(financial_df, crit, all_financials_data, peer_data_cache)
             results[f"C{crit['id']}"] = result
             if result['pass']:
                 points += 3 / len(optional_criteria)
@@ -275,10 +236,16 @@ class LiquidityScorer:
     
 # %%
 scorer = LiquidityScorer()
+
+liq_peer_data_cache = {}
+liq_metric_codes = ['ryq1', 'ryq16', 'ryq71', 'ryq20']
+for code in liq_metric_codes:
+    liq_peer_data_cache[code] = [scorer.get_metric_period_dict(df, code) for df in financials_ratios_data.values()]
+
 liq_scores = {}
 
 for idx, (symbol, financials_df) in enumerate(financials_ratios_data.items()):
-    score_result = scorer.score_financial(symbol, financials_df, financials_ratios_data)
+    score_result = scorer.score_financial(symbol, financials_df, financials_ratios_data, liq_peer_data_cache)
     liq_scores[symbol] = score_result
 
 # %%
@@ -332,7 +299,7 @@ class ProfitabilityScorer:
         metric_data = metric_data.dropna(subset=['value'])
         return dict(metric_data[['period_key', 'value']].itertuples(index=False, name=None))
     
-    def evaluate_criterion(self, financial_df, criterion, all_financials_data):
+    def evaluate_criterion(self, financial_df, criterion, all_financials_data, peer_data_cache=None):
         """Evaluate a single criterion over the last 12 quarters (with pass rate ≥ 50%)"""
         try:
             crit_type = criterion['type']
@@ -365,7 +332,11 @@ class ProfitabilityScorer:
                     return {'pass': False, 'reason': 'No period values available', 'values': []}
 
                 period_values = {p: v for p, v in series}
-                peer_maps = [self.get_metric_period_dict(df, criterion['code']) for df in all_financials_data.values()]
+                code = criterion['code']
+                if peer_data_cache and code in peer_data_cache:
+                    peer_maps = peer_data_cache[code]
+                else:
+                    peer_maps = [self.get_metric_period_dict(df, code) for df in all_financials_data.values()]
 
                 period_passes = []
                 percentiles = []
@@ -403,7 +374,7 @@ class ProfitabilityScorer:
         except Exception as e:
             return {'pass': False, 'reason': str(e)}
     
-    def score_financial(self, symbol, financial_df, all_financials_data):
+    def score_financial(self, symbol, financial_df, all_financials_data, peer_data_cache=None):
         """Calculate profitability score for a financial (0-5 points)"""
         results = {}
         points = 0
@@ -412,7 +383,7 @@ class ProfitabilityScorer:
         must_have_results = []
         for crit in self.criteria:
             if crit['must_have']:
-                result = self.evaluate_criterion(financial_df, crit, all_financials_data)
+                result = self.evaluate_criterion(financial_df, crit, all_financials_data, peer_data_cache)
                 must_have_results.append(result['pass'])
                 results[f"C{crit['id']}"] = result
         
@@ -422,7 +393,7 @@ class ProfitabilityScorer:
         # Optional criteria (distribute remaining 3 points)
         optional_criteria = [c for c in self.criteria if not c['must_have']]
         for crit in optional_criteria:
-            result = self.evaluate_criterion(financial_df, crit, all_financials_data)
+            result = self.evaluate_criterion(financial_df, crit, all_financials_data, peer_data_cache)
             results[f"C{crit['id']}"] = result
             if result['pass']:
                 points += 3 / len(optional_criteria)
@@ -434,10 +405,16 @@ class ProfitabilityScorer:
 
 # %%
 prof_scorer = ProfitabilityScorer()
+
+prof_peer_data_cache = {}
+prof_metric_codes = ['ryq76', 'ryq27', 'ryq39', 'ryq34']
+for code in prof_metric_codes:
+    prof_peer_data_cache[code] = [prof_scorer.get_metric_period_dict(df, code) for df in financials_ratios_data.values()]
+
 prof_scores = {}
 
 for idx, (symbol, financials_df) in enumerate(financials_ratios_data.items()):
-    score_result = prof_scorer.score_financial(symbol, financials_df, financials_ratios_data)
+    score_result = prof_scorer.score_financial(symbol, financials_df, financials_ratios_data, prof_peer_data_cache)
     prof_scores[symbol] = score_result
 
 # %%
@@ -491,7 +468,7 @@ class SolvencyScorer:
         metric_data = metric_data.dropna(subset=['value'])
         return dict(metric_data[['period_key', 'value']].itertuples(index=False, name=None))
 
-    def evaluate_criterion(self, financial_df, criterion, all_financials_data):
+    def evaluate_criterion(self, financial_df, criterion, all_financials_data, peer_data_cache=None):
         """Evaluate a single criterion over the last 12 quarters (with pass rate ≥ 50%)"""
         try:
             crit_type = criterion['type']
@@ -524,7 +501,11 @@ class SolvencyScorer:
                     return {'pass': False, 'reason': 'No period values available', 'values': []}
 
                 period_values = {p: v for p, v in series}
-                peer_maps = [self.get_metric_period_dict(df, criterion['code']) for df in all_financials_data.values()]
+                code = criterion['code']
+                if peer_data_cache and code in peer_data_cache:
+                    peer_maps = peer_data_cache[code]
+                else:
+                    peer_maps = [self.get_metric_period_dict(df, code) for df in all_financials_data.values()]
 
                 period_passes = []
                 percentiles = []
@@ -562,14 +543,14 @@ class SolvencyScorer:
         except Exception as e:
             return {'pass': False, 'reason': str(e)}
 
-    def score_financial(self, symbol, financial_df, all_financials_data):
+    def score_financial(self, symbol, financial_df, all_financials_data, peer_data_cache=None):
         results = {}
         points = 0
 
         must_have_results = []
         for crit in self.criteria:
             if crit['must_have']:
-                result = self.evaluate_criterion(financial_df, crit, all_financials_data)
+                result = self.evaluate_criterion(financial_df, crit, all_financials_data, peer_data_cache)
                 must_have_results.append(result['pass'])
                 results[f"C{crit['id']}"] = result
 
@@ -578,7 +559,7 @@ class SolvencyScorer:
 
         optional_criteria = [c for c in self.criteria if not c['must_have']]
         for crit in optional_criteria:
-            result = self.evaluate_criterion(financial_df, crit, all_financials_data)
+            result = self.evaluate_criterion(financial_df, crit, all_financials_data, peer_data_cache)
             results[f"C{crit['id']}"] = result
             if result['pass']:
                 points += 3 / len(optional_criteria)
@@ -591,10 +572,16 @@ class SolvencyScorer:
 
 # %%
 solv_scorer = SolvencyScorer()
+
+solv_peer_data_cache = {}
+solv_metric_codes = ['ryq6', 'ryq71', 'ryq31']
+for code in solv_metric_codes:
+    solv_peer_data_cache[code] = [solv_scorer.get_metric_period_dict(df, code) for df in financials_ratios_data.values()]
+
 solv_scores = {}
 
 for idx, (symbol, financials_df) in enumerate(financials_ratios_data.items()):
-    score_result = solv_scorer.score_financial(symbol, financials_df, financials_ratios_data)
+    score_result = solv_scorer.score_financial(symbol, financials_df, financials_ratios_data, solv_peer_data_cache)
     solv_scores[symbol] = score_result
 
 # %%
@@ -625,7 +612,7 @@ class RelativeValuationScorer:
             return None
         return float((peer <= latest_value).mean())
 
-    def evaluate_criterion(self, financials_df, criterion, all_financials_data):
+    def evaluate_criterion(self, financials_df, criterion, all_financials_data, peer_data_cache=None):
         try:
             crit_type = criterion['type']
 
@@ -715,7 +702,7 @@ class RelativeValuationScorer:
         except Exception as e:
             return {'pass': False, 'reason': str(e)}
 
-    def score_financials(self, symbol, financials_df, all_financials_data):
+    def score_financials(self, symbol, financials_df, all_financials_data, peer_data_cache=None):
         results = {}
         points = 0.0
 
@@ -723,7 +710,7 @@ class RelativeValuationScorer:
         must_have_results = []
         for crit in self.criteria:
             if crit.get('must_have', False):
-                result = self.evaluate_criterion(financials_df, crit, all_financials_data)
+                result = self.evaluate_criterion(financials_df, crit, all_financials_data, peer_data_cache)
                 must_have_results.append(result['pass'])
                 results[f"C{crit['id']}"] = result
         
@@ -733,7 +720,7 @@ class RelativeValuationScorer:
         # Optional criteria (distribute remaining 3 points)
         optional_criteria = [c for c in self.criteria if not c.get('must_have', False)]
         for crit in optional_criteria:
-            result = self.evaluate_criterion(financials_df, crit, all_financials_data)
+            result = self.evaluate_criterion(financials_df, crit, all_financials_data, peer_data_cache)
             results[f"C{crit['id']}"] = result
             if result['pass']:
                 points += 3 / len(optional_criteria)  # Distribute 3 points among optional
@@ -750,7 +737,7 @@ try:
     val_scores = {}
 
     for symbol, financials_df in financials_ratios_data.items():
-        val_scores[symbol] = val_scorer.score_financials(symbol, financials_df, financials_ratios_data)    
+        val_scores[symbol] = val_scorer.score_financials(symbol, financials_df, financials_ratios_data, None)    
     
     # Build combined scores (align symbols across all scorers)
     symbols = sorted(set(liq_scores.keys()) | set(prof_scores.keys()) | set(solv_scores.keys()) | set(val_scores.keys()))

@@ -3,6 +3,10 @@ import requests
 import pandas as pd
 import os
 import TechAna_DRAFT as TechAna
+from Filtering_Stock import filter_stocks_by_price_and_liquidity
+
+START_DATE = TechAna.START_DATE
+END_DATE = TechAna.END_DATE
 
 all_stocks = []
 bank_symbols = []
@@ -10,6 +14,7 @@ all_ratios_data = []
 df_ratios = pd.DataFrame()
 bank_ratios_data = {}
 as_of_date = os.getenv("Fund_AsOf_Date")
+as_of_ts = None
 
 # Make exports safe even if fetch or scoring fails
 combined_scores_draft = pd.DataFrame()
@@ -19,7 +24,16 @@ try:
     r = requests.get("http://192.168.8.190:8000/MKD/stock_info")
     r.raise_for_status()
     all_stocks = r.json()
-    bank_symbols = [s['symbol'] for s in all_stocks if s.get('industry_lv1') == 'Banks']
+    filtered_stocks = [s for s in all_stocks if s.get('industry_lv1') == 'Banks']
+    filtered_stocks = filter_stocks_by_price_and_liquidity(
+        filtered_stocks,
+        min_price=10000,
+        min_volume_threshold=20000,
+        min_pass_rate=0.50,
+        start_date=getattr(TechAna, 'START_DATE', None),
+        end_date=getattr(TechAna, 'END_DATE', None),
+    )
+    bank_symbols = [s['symbol'] for s in filtered_stocks]
 
     url = "http://192.168.8.190:8000/MKD/stock-ratios"
     params = {
@@ -28,6 +42,7 @@ try:
         "num_periods": 12,
         "language": "en"
     }
+    
     r = requests.get(url, params=params, headers={"accept": "application/json"})
     r.raise_for_status()
     all_ratios_data.extend(r.json())
@@ -35,25 +50,22 @@ try:
     # Convert to DataFrame
     df_ratios = pd.DataFrame(all_ratios_data)
 
-    # Handle date columns - stock-ratios may use year/quarter instead of date
-    if 'date' in df_ratios.columns:
-        df_ratios['date'] = pd.to_datetime(df_ratios['date'], errors='coerce')
-    elif 'year' in df_ratios.columns and 'quarter' in df_ratios.columns:
-        # Create date from year and quarter (end of quarter)
-        quarter_months = {1: 3, 2: 6, 3: 9, 4: 12}
-        df_ratios['date'] = pd.to_datetime(
-            df_ratios.apply(
-                lambda row: f"{int(row['year'])}-{quarter_months.get(int(row['quarter']), 12)}-01",
-                axis=1
-            ),
-            errors='coerce'
-        )
     if not as_of_date:
         try:
             end_dt = pd.to_datetime(getattr(TechAna, 'END_DATE', None), errors = "coerce")
             if pd.notna(end_dt):
                 prev_q_end = (end_dt.to_period('Q') - 1).end_time
                 as_of_date = prev_q_end.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
+    # Guard against look-ahead bias by cutting fundamental data at as_of_date.
+    if as_of_date:
+        try:
+            as_of_ts = pd.to_datetime(as_of_date, errors="coerce")
+            if pd.notna(as_of_ts) and not df_ratios.empty and 'date' in df_ratios.columns:
+                ratio_dates = pd.to_datetime(df_ratios['date'], errors='coerce')
+                df_ratios = df_ratios[ratio_dates.notna() & (ratio_dates <= as_of_ts)].copy()
         except Exception:
             pass
 
@@ -65,7 +77,6 @@ try:
 except Exception as e:
     # Keep importable even if API is down
     print(f"[Fund_BANK] Warning: failed to fetch bank ratios: {e}")
-
 
 # %%
 # Liquidity Scoring System (LIQ)
@@ -93,7 +104,7 @@ class LiquidityScorer:
             return metric_data['value'].dropna().iloc[-1] if len(metric_data.dropna()) > 0 else None
         return None
     
-    def evaluate_criterion(self, bank_df, criterion, all_banks_data):
+    def evaluate_criterion(self, bank_df, criterion, all_banks_data, peer_data_cache=None):
         """Evaluate a single criterion for a bank"""
         try:
             code = criterion['code']
@@ -114,8 +125,11 @@ class LiquidityScorer:
             
             # Peer percentile criterion
             elif crit_type == 'peer_percentile':
-                peer_values = [self.get_metric_value(df, code) for df in all_banks_data.values()]
-                peer_values = [v for v in peer_values if v is not None]
+                if peer_data_cache and code in peer_data_cache:
+                    peer_values = peer_data_cache[code]
+                else:
+                    peer_values = [self.get_metric_value(df, code) for df in all_banks_data.values()]
+                    peer_values = [v for v in peer_values if v is not None]
                 if len(peer_values) > 0:
                     if criterion['direction'] == 'lower':
                         pct = (latest_value <= pd.Series(peer_values)).sum() / len(peer_values)
@@ -147,7 +161,7 @@ class LiquidityScorer:
         except Exception as e:
             return {'pass': False, 'reason': str(e)}
     
-    def score_bank(self, symbol, bank_df, all_banks_data):
+    def score_bank(self, symbol, bank_df, all_banks_data, peer_data_cache=None):
         """Calculate liquidity score for a bank (0-5 points)"""
         results = {}
         points = 0
@@ -157,7 +171,7 @@ class LiquidityScorer:
         must_have_results = []
         for crit in self.criteria:
             if crit['must_have']:
-                result = self.evaluate_criterion(bank_df, crit, all_banks_data)
+                result = self.evaluate_criterion(bank_df, crit, all_banks_data, peer_data_cache)
                 must_have_results.append(result['pass'])
                 results[f"C{crit['id']}"] = result
         
@@ -167,7 +181,7 @@ class LiquidityScorer:
         # Optional criteria (distribute remaining 3 points)
         optional_criteria = [c for c in self.criteria if not c['must_have']]
         for crit in optional_criteria:
-            result = self.evaluate_criterion(bank_df, crit, all_banks_data)
+            result = self.evaluate_criterion(bank_df, crit, all_banks_data, peer_data_cache)
             results[f"C{crit['id']}"] = result
             if result['pass']:
                 points += 3 / len(optional_criteria)  # Distribute 3 points among optional
@@ -181,10 +195,17 @@ class LiquidityScorer:
 # %%
 # Calculate LIQ scores for all banks
 scorer = LiquidityScorer()
+
+liq_peer_data_cache = {}
+liq_metric_codes = ['ryq57', 'casa']
+for code in liq_metric_codes:
+    liq_peer_data_cache[code] = [scorer.get_metric_value(df, code) for df in bank_ratios_data.values()]
+    liq_peer_data_cache[code] = [v for v in liq_peer_data_cache[code] if v is not None]
+
 liq_scores = {}
 
 for idx, (symbol, bank_df) in enumerate(bank_ratios_data.items()):
-    score_result = scorer.score_bank(symbol, bank_df, bank_ratios_data)
+    score_result = scorer.score_bank(symbol, bank_df, bank_ratios_data, liq_peer_data_cache)
     liq_scores[symbol] = score_result
 
 # %%
@@ -207,7 +228,7 @@ class ProfitabilityScorer:
             return metric_data['value'].dropna().iloc[-1] if len(metric_data.dropna()) > 0 else None
         return None
     
-    def evaluate_criterion(self, bank_df, criterion, all_banks_data):
+    def evaluate_criterion(self, bank_df, criterion, all_banks_data, peer_data_cache=None):
         """Evaluate a single criterion for a bank"""
         try:
             code = criterion['code']
@@ -228,8 +249,11 @@ class ProfitabilityScorer:
             
             # Peer percentile criterion
             elif crit_type == 'peer_percentile':
-                peer_values = [self.get_metric_value(df, code) for df in all_banks_data.values()]
-                peer_values = [v for v in peer_values if v is not None]
+                if peer_data_cache and code in peer_data_cache:
+                    peer_values = peer_data_cache[code]
+                else:
+                    peer_values = [self.get_metric_value(df, code) for df in all_banks_data.values()]
+                    peer_values = [v for v in peer_values if v is not None]
                 if len(peer_values) > 0:
                     if criterion['direction'] == 'lower':
                         pct = sum(1 for v in peer_values if latest_value <= v) / len(peer_values)
@@ -241,8 +265,11 @@ class ProfitabilityScorer:
             
             # Peer or Absolute criterion (ROE: either >= peer_median OR >= abs_threshold)
             elif crit_type == 'peer_or_abs':
-                peer_values = [self.get_metric_value(df, code) for df in all_banks_data.values()]
-                peer_values = [v for v in peer_values if v is not None]
+                if peer_data_cache and code in peer_data_cache:
+                    peer_values = peer_data_cache[code]
+                else:
+                    peer_values = [self.get_metric_value(df, code) for df in all_banks_data.values()]
+                    peer_values = [v for v in peer_values if v is not None]
                 
                 # Check absolute threshold
                 abs_pass = latest_value >= criterion['abs_threshold']
@@ -264,7 +291,7 @@ class ProfitabilityScorer:
         except Exception as e:
             return {'pass': False, 'reason': str(e)}
     
-    def score_bank(self, symbol, bank_df, all_banks_data):
+    def score_bank(self, symbol, bank_df, all_banks_data, peer_data_cache=None):
         """Calculate profitability score for a bank (0-5 points)"""
         results = {}
         points = 0
@@ -273,7 +300,7 @@ class ProfitabilityScorer:
         must_have_results = []
         for crit in self.criteria:
             if crit['must_have']:
-                result = self.evaluate_criterion(bank_df, crit, all_banks_data)
+                result = self.evaluate_criterion(bank_df, crit, all_banks_data, peer_data_cache)
                 must_have_results.append(result['pass'])
                 results[f"C{crit['id']}"] = result
         
@@ -283,7 +310,7 @@ class ProfitabilityScorer:
         # Optional criteria (distribute remaining 3 points)
         optional_criteria = [c for c in self.criteria if not c['must_have']]
         for crit in optional_criteria:
-            result = self.evaluate_criterion(bank_df, crit, all_banks_data)
+            result = self.evaluate_criterion(bank_df, crit, all_banks_data, peer_data_cache)
             results[f"C{crit['id']}"] = result
             if result['pass']:
                 points += 3 / len(optional_criteria)  # Distribute 3 points among optional
@@ -297,10 +324,17 @@ class ProfitabilityScorer:
 # %%
 # Calculate PROF scores for all banks
 prof_scorer = ProfitabilityScorer()
+
+prof_peer_data_cache = {}
+prof_metric_codes = ['ryq44', 'ryq48', 'ryq46', 'ryq12']
+for code in prof_metric_codes:
+    prof_peer_data_cache[code] = [prof_scorer.get_metric_value(df, code) for df in bank_ratios_data.values()]
+    prof_peer_data_cache[code] = [v for v in prof_peer_data_cache[code] if v is not None]
+
 prof_scores = {}
 
 for idx, (symbol, bank_df) in enumerate(bank_ratios_data.items()):
-    score_result = prof_scorer.score_bank(symbol, bank_df, bank_ratios_data)
+    score_result = prof_scorer.score_bank(symbol, bank_df, bank_ratios_data, prof_peer_data_cache)
     prof_scores[symbol] = score_result
 
 # %%
@@ -331,7 +365,7 @@ class SolvencyScorer:
             return metric_data['value'].dropna()
         return pd.Series()
     
-    def evaluate_criterion(self, bank_df, criterion, all_banks_data):
+    def evaluate_criterion(self, bank_df, criterion, all_banks_data, peer_data_cache=None):
         """Evaluate a single criterion for a bank"""
         try:
             crit_type = criterion['type']
@@ -358,8 +392,11 @@ class SolvencyScorer:
                 if latest_value is None:
                     return {'pass': False, 'reason': f'Code {code} not found', 'value': None}
                 
-                peer_values = [self.get_metric_value(df, code) for df in all_banks_data.values()]
-                peer_values = [v for v in peer_values if v is not None]
+                if peer_data_cache and code in peer_data_cache:
+                    peer_values = peer_data_cache[code]
+                else:
+                    peer_values = [self.get_metric_value(df, code) for df in all_banks_data.values()]
+                    peer_values = [v for v in peer_values if v is not None]
                 if len(peer_values) > 0:
                     peer_series = pd.Series(peer_values)
                     if criterion['direction'] == 'lower':
@@ -381,16 +418,18 @@ class SolvencyScorer:
                 if credit_latest is None:
                     return {'pass': False, 'reason': f'Code {credit_code} not found'}
                 
-                peer_credit = [self.get_metric_value(df, credit_code) for df in all_banks_data.values()]
-                peer_credit = [v for v in peer_credit if v is not None]
-                credit_median = sum(peer_credit) / len(peer_credit) if len(peer_credit) > 0 else None
-                # Better: use sorted list to get median
+                if peer_data_cache and credit_code in peer_data_cache:
+                    peer_credit = peer_data_cache[credit_code]
+                else:
+                    peer_credit = [self.get_metric_value(df, credit_code) for df in all_banks_data.values()]
+                    peer_credit = [v for v in peer_credit if v is not None]
+                
+                credit_median = None
+                credit_pass = False
                 if len(peer_credit) > 0:
                     sorted_credit = sorted(peer_credit)
                     credit_median = sorted_credit[len(sorted_credit)//2] if len(sorted_credit) > 0 else None
                     credit_pass = credit_latest >= credit_median
-                else:
-                    credit_pass = False
                 
                 # Check 2: NPL not worsening (current NPL <= 4q average)
                 npl_series = self.get_metric_series(bank_df, npl_code)
@@ -422,7 +461,7 @@ class SolvencyScorer:
         except Exception as e:
             return {'pass': False, 'reason': str(e)}
     
-    def score_bank(self, symbol, bank_df, all_banks_data):
+    def score_bank(self, symbol, bank_df, all_banks_data, peer_data_cache=None):
         """Calculate solvency score for a bank (0-5 points)"""
         results = {}
         points = 0
@@ -431,7 +470,7 @@ class SolvencyScorer:
         must_have_results = []
         for crit in self.criteria:
             if crit['must_have']:
-                result = self.evaluate_criterion(bank_df, crit, all_banks_data)
+                result = self.evaluate_criterion(bank_df, crit, all_banks_data, peer_data_cache)
                 must_have_results.append(result['pass'])
                 results[f"C{crit['id']}"] = result
         
@@ -441,7 +480,7 @@ class SolvencyScorer:
         # Optional criteria (distribute remaining 3 points)
         optional_criteria = [c for c in self.criteria if not c['must_have']]
         for crit in optional_criteria:
-            result = self.evaluate_criterion(bank_df, crit, all_banks_data)
+            result = self.evaluate_criterion(bank_df, crit, all_banks_data, peer_data_cache)
             results[f"C{crit['id']}"] = result
             if result['pass']:
                 points += 3 / len(optional_criteria)  # Distribute 3 points among optional
@@ -455,10 +494,17 @@ class SolvencyScorer:
 # %%
 # Calculate SOLV scores for all banks
 solv_scorer = SolvencyScorer()
+
+solv_peer_data_cache = {}
+solv_metric_codes = ['ryq58', 'ryq59', 'ryq56', 'ryq60']
+for code in solv_metric_codes:
+    solv_peer_data_cache[code] = [solv_scorer.get_metric_value(df, code) for df in bank_ratios_data.values()]
+    solv_peer_data_cache[code] = [v for v in solv_peer_data_cache[code] if v is not None]
+
 solv_scores = {}
 
 for idx, (symbol, bank_df) in enumerate(bank_ratios_data.items()):
-    score_result = solv_scorer.score_bank(symbol, bank_df, bank_ratios_data)
+    score_result = solv_scorer.score_bank(symbol, bank_df, bank_ratios_data, solv_peer_data_cache)
     solv_scores[symbol] = score_result
 
 # %%
@@ -489,7 +535,7 @@ class RelativeValuationScorer:
             return None
         return float((peer <= latest_value).mean())
 
-    def evaluate_criterion(self, bank_df, criterion, all_banks_data):
+    def evaluate_criterion(self, bank_df, criterion, all_banks_data, peer_data_cache=None):
         try:
             crit_type = criterion['type']
 
@@ -579,7 +625,7 @@ class RelativeValuationScorer:
         except Exception as e:
             return {'pass': False, 'reason': str(e)}
 
-    def score_bank(self, symbol, bank_df, all_banks_data):
+    def score_bank(self, symbol, bank_df, all_banks_data, peer_data_cache=None):
         results = {}
         points = 0.0
 
@@ -587,7 +633,7 @@ class RelativeValuationScorer:
         must_have_results = []
         for crit in self.criteria:
             if crit.get('must_have', False):
-                result = self.evaluate_criterion(bank_df, crit, all_banks_data)
+                result = self.evaluate_criterion(bank_df, crit, all_banks_data, peer_data_cache)
                 must_have_results.append(result['pass'])
                 results[f"C{crit['id']}"] = result
         
@@ -597,7 +643,7 @@ class RelativeValuationScorer:
         # Optional criteria (distribute remaining 3 points)
         optional_criteria = [c for c in self.criteria if not c.get('must_have', False)]
         for crit in optional_criteria:
-            result = self.evaluate_criterion(bank_df, crit, all_banks_data)
+            result = self.evaluate_criterion(bank_df, crit, all_banks_data, peer_data_cache)
             results[f"C{crit['id']}"] = result
             if result['pass']:
                 points += 3 / len(optional_criteria)  # Distribute 3 points among optional
@@ -615,15 +661,16 @@ try:
     val_scores = {}
 
     for symbol, bank_df in bank_ratios_data.items():
-        val_scores[symbol] = val_scorer.score_bank(symbol, bank_df, bank_ratios_data)    
+        val_scores[symbol] = val_scorer.score_bank(symbol, bank_df, bank_ratios_data, None)    
     
-    # Build combined scores
+    # Build combined scores (align symbols across all scorers)
+    symbols = sorted(set(liq_scores.keys()) | set(prof_scores.keys()) | set(solv_scores.keys()) | set(val_scores.keys()))
     combined_scores_draft = pd.DataFrame({
-        'Symbol': sorted(liq_scores.keys()),
-        'LIQ_Score': [liq_scores[s]['score'] for s in sorted(liq_scores.keys())],
-        'PROF_Score': [prof_scores[s]['score'] for s in sorted(prof_scores.keys())],
-        'SOLV_Score': [solv_scores[s]['score'] for s in sorted(solv_scores.keys())],
-        'VAL_Score': [val_scores[s]['score'] for s in sorted(val_scores.keys())]
+        'Symbol': symbols,
+        'LIQ_Score': [liq_scores.get(s, {}).get('score', 0) for s in symbols],
+        'PROF_Score': [prof_scores.get(s, {}).get('score', 0) for s in symbols],
+        'SOLV_Score': [solv_scores.get(s, {}).get('score', 0) for s in symbols],
+        'VAL_Score': [val_scores.get(s, {}).get('score', 0) for s in symbols]
     })
     combined_scores_draft['Total_Score'] = combined_scores_draft['LIQ_Score'] + combined_scores_draft['PROF_Score'] + combined_scores_draft['SOLV_Score'] + combined_scores_draft['VAL_Score']
     combined_scores_draft = combined_scores_draft.sort_values('Total_Score', ascending=False).reset_index(drop=True)

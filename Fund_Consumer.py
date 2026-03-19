@@ -4,6 +4,10 @@ import pandas as pd
 import numpy as np
 import os
 import TechAna_DRAFT as TechAna
+from Filtering_Stock import filter_stocks_by_price_and_liquidity
+
+START_DATE = TechAna.START_DATE
+END_DATE = TechAna.END_DATE
 
 consumer = ['Consumer Goods', 'Consumer Services']
 all_stocks = []
@@ -12,6 +16,7 @@ all_ratios_data = []
 df_ratios = pd.DataFrame()
 consumer_ratios_data = {}
 as_of_date = os.getenv("Fund_AsOf_Date")
+as_of_ts = None
 
 combined_scores_draft = pd.DataFrame()
 
@@ -23,59 +28,15 @@ try:
         s for s in all_stocks
         if s.get('industry_lv1') in consumer
     ]
+    filtered_stocks = filter_stocks_by_price_and_liquidity(
+        filtered_stocks,
+        min_price=11000,
+        min_volume_threshold=20000,
+        min_pass_rate=0.50,
+        start_date=getattr(TechAna, 'START_DATE', None),
+        end_date=getattr(TechAna, 'END_DATE', None),
+    )
     consumer_symbols = [s['symbol'] for s in filtered_stocks]
-
-    min_price = 10000
-    price_date = getattr(TechAna, 'END_DATE', None)
-    if price_date and consumer_symbols:
-        price_params = {
-            "symbols": ",".join(consumer_symbols),
-            "start_date": price_date,
-            "end_date": price_date
-        }
-        r = requests.get(
-            "http://192.168.8.190:8000/MKD/stock_daily",
-            params=price_params,
-            headers={"accept": "application/json"},
-            timeout=30
-        )
-        r.raise_for_status()
-        price_payload = r.json()
-        price_items = []
-        if isinstance(price_payload, dict):
-            for sym, rows in price_payload.items():
-                if isinstance(rows, list):
-                    for row in rows:
-                        if isinstance(row, dict):
-                            row = {**row, "symbol": row.get("symbol", sym)}
-                            price_items.append(row)
-                elif isinstance(rows, dict):
-                    row = {**rows, "symbol": rows.get("symbol", sym)}
-                    price_items.append(row)
-        elif isinstance(price_payload, list):
-            price_items = price_payload
-
-        price_map = {}
-        for row in price_items:
-            if not isinstance(row, dict):
-                continue
-            sym = row.get('symbol')
-            if not sym:
-                continue
-            price = row.get('adj_close')
-            if price is None:
-                price = row.get('close')
-            if price is None:
-                continue
-            try:
-                price_map[sym] = float(price)
-            except (TypeError, ValueError):
-                continue
-
-        if price_map:
-            min_price_symbols = {s for s, v in price_map.items() if v >= min_price}
-            filtered_stocks = [s for s in filtered_stocks if s.get('symbol') in min_price_symbols]
-            consumer_symbols = [s['symbol'] for s in filtered_stocks]
 
     url = "http://192.168.8.190:8000/MKD/stock-ratios"
     params = {
@@ -88,50 +49,6 @@ try:
     r.raise_for_status()
     all_ratios_data.extend(r.json())
 
-    url_daily = "http://192.168.8.190:8000/MKD/stock-ratios-daily"
-    daily_params = {
-        "symbols": ",".join(consumer_symbols),
-        "codes": "30022",
-        "start_date": "2025-11-01",
-        "end_date": "2025-12-31"
-    }
-    r = requests.get(url_daily, params=daily_params, headers={"accept": "application/json"})
-    r.raise_for_status()
-    
-    daily_payload = r.json()
-    if isinstance(daily_payload, dict):
-        daily_data = daily_payload.get('data', [])
-    else:
-        daily_data = daily_payload
-
-    matching_volume_sum = {}
-    matching_volume_count = {}
-    for record in daily_data:
-        if not isinstance(record, dict):
-            continue
-        if str(record.get('code')) != '30022':
-            continue
-        symbol = record.get('symbol')
-        value = record.get('value')
-        if symbol and value is not None:
-            matching_volume_sum[symbol] = matching_volume_sum.get(symbol, 0.0) + float(value)
-            matching_volume_count[symbol] = matching_volume_count.get(symbol, 0) + 1
-
-    matching_volume_12_2025 = {
-        symbol: matching_volume_sum[symbol] / matching_volume_count[symbol]
-        for symbol in matching_volume_sum
-        if matching_volume_count.get(symbol, 0) > 0
-    }
-
-    # Sort by average matching volume December 2025 and take top 100
-    filtered_stocks = sorted(
-        consumer_symbols,
-        key=lambda s: float(matching_volume_12_2025.get(s, float('-inf'))),
-        reverse=True
-    )
-    top_75_stocks = filtered_stocks[:75]
-    consumer_symbols = top_75_stocks
-
     df_ratios = pd.DataFrame(all_ratios_data)
 
     if not as_of_date:
@@ -140,6 +57,16 @@ try:
             if pd.notna(end_dt):
                 prev_q_end = (end_dt.to_period('Q') - 1).end_time
                 as_of_date = prev_q_end.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
+    # Guard against look-ahead bias by cutting fundamental data at as_of_date.
+    if as_of_date:
+        try:
+            as_of_ts = pd.to_datetime(as_of_date, errors="coerce")
+            if pd.notna(as_of_ts) and not df_ratios.empty and 'date' in df_ratios.columns:
+                ratio_dates = pd.to_datetime(df_ratios['date'], errors='coerce')
+                df_ratios = df_ratios[ratio_dates.notna() & (ratio_dates <= as_of_ts)].copy()
         except Exception:
             pass
 
@@ -739,7 +666,7 @@ class RelativeValuationScorer:
             return None
         return float((peer <= latest_value).mean())
 
-    def evaluate_criterion(self, consumer_df, criterion, all_consumer_data):
+    def evaluate_criterion(self, consumer_df, criterion, all_consumer_data, peer_data_cache=None):
         try:
             crit_type = criterion['type']
 
@@ -762,7 +689,11 @@ class RelativeValuationScorer:
                 if latest is None:
                     return {'pass': False, 'reason': f'Code {code} not found', 'value': None}
 
-                peer_values = [self.get_metric_value(df, code) for df in all_consumer_data.values()]
+                # Use pre-computed peer_data_cache if available
+                if peer_data_cache and code in peer_data_cache:
+                    peer_values = peer_data_cache[code]
+                else:
+                    peer_values = [self.get_metric_value(df, code) for df in all_consumer_data.values()]
                 pct = self._ecdf_percentile(latest, peer_values)
                 if pct is None:
                     return {'pass': False, 'reason': 'No peer values', 'value': latest}
@@ -805,15 +736,20 @@ class RelativeValuationScorer:
 
                 ratio = pb / roe
 
-                peer_ratios = []
-                for df in all_consumer_data.values():
-                    pb_i = self.get_metric_value(df, criterion['pb_code'])
-                    roe_i = self.get_metric_value(df, criterion['roe_code'])
-                    if pb_i is None or roe_i is None or roe_i == 0:
-                        continue
-                    if roe_i < 0.10:
-                        continue
-                    peer_ratios.append(pb_i / roe_i)
+                # Use pre-computed peer_data_cache if available
+                cache_key = f"{criterion['pb_code']}/{criterion['roe_code']}"
+                if peer_data_cache and cache_key in peer_data_cache:
+                    peer_ratios = peer_data_cache[cache_key]
+                else:
+                    peer_ratios = []
+                    for df in all_consumer_data.values():
+                        pb_i = self.get_metric_value(df, criterion['pb_code'])
+                        roe_i = self.get_metric_value(df, criterion['roe_code'])
+                        if pb_i is None or roe_i is None or roe_i == 0:
+                            continue
+                        if roe_i < 0.10:
+                            continue
+                        peer_ratios.append(pb_i / roe_i)
 
                 if len(peer_ratios) > 0:
                     peer_median = float(pd.Series(peer_ratios).median())
@@ -829,7 +765,7 @@ class RelativeValuationScorer:
         except Exception as e:
             return {'pass': False, 'reason': str(e)}
 
-    def score_consumer(self, symbol, consumer_df, all_consumer_data):
+    def score_consumer(self, symbol, consumer_df, all_consumer_data, peer_data_cache=None):
         results = {}
         points = 0.0
 
@@ -837,7 +773,7 @@ class RelativeValuationScorer:
         must_have_results = []
         for crit in self.criteria:
             if crit.get('must_have', False):
-                result = self.evaluate_criterion(consumer_df, crit, all_consumer_data)
+                result = self.evaluate_criterion(consumer_df, crit, all_consumer_data, peer_data_cache)
                 must_have_results.append(result['pass'])
                 results[f"C{crit['id']}"] = result
         
@@ -847,7 +783,7 @@ class RelativeValuationScorer:
         # Optional criteria (distribute remaining 3 points)
         optional_criteria = [c for c in self.criteria if not c.get('must_have', False)]
         for crit in optional_criteria:
-            result = self.evaluate_criterion(consumer_df, crit, all_consumer_data)
+            result = self.evaluate_criterion(consumer_df, crit, all_consumer_data, peer_data_cache)
             results[f"C{crit['id']}"] = result
             if result['pass']:
                 points += 3 / len(optional_criteria)  # Distribute 3 points among optional
@@ -861,10 +797,26 @@ class RelativeValuationScorer:
 # %%
 try:
     val_scorer = RelativeValuationScorer()
+    
+    # Setup peer_data_cache for RelativeValuationScorer
+    val_peer_data_cache = {}
+    val_metric_codes = ['ryd25', 'ryd21']
+    for code in val_metric_codes:
+        val_peer_data_cache[code] = [val_scorer.get_metric_value(df, code) for df in consumer_ratios_data.values()]
+    
+    # Pre-compute peer ratios for ratio_threshold
+    pb_values = [val_scorer.get_metric_value(df, 'ryd25') for df in consumer_ratios_data.values()]
+    roe_values = [val_scorer.get_metric_value(df, 'ryq12') for df in consumer_ratios_data.values()]
+    peer_ratios = []
+    for pb, roe in zip(pb_values, roe_values):
+        if pb is not None and roe is not None and roe != 0 and roe >= 0.10:
+            peer_ratios.append(pb / roe)
+    val_peer_data_cache['ryd25/ryq12'] = peer_ratios
+    
     val_scores = {}
 
     for symbol, consumer_df in consumer_ratios_data.items():
-        val_scores[symbol] = val_scorer.score_consumer(symbol, consumer_df, consumer_ratios_data)    
+        val_scores[symbol] = val_scorer.score_consumer(symbol, consumer_df, consumer_ratios_data, val_peer_data_cache)    
     
     # Build combined scores
     combined_scores_draft = pd.DataFrame({

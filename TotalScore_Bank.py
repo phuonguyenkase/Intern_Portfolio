@@ -5,6 +5,7 @@ from TechAna_DRAFT import START_DATE, END_DATE
 
 try:
     from Fund_Bank import combined_scores_draft as df_final
+    print("Success")
 except ImportError:
     print("ERROR")
     df_final = pd.DataFrame(columns=['Symbol', 'Total_Score'])
@@ -97,3 +98,5 @@ if __name__ == "__main__":
         print(display_df.to_string(index=False))
     else:
         print("No data validated for analysis.")
+        
+# %%
